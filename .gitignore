@@ -1,0 +1,15 @@
+# 测试运行时生成的断言页面、stderr 与临时产物（node test/run.js 会自动重生成）
+test/_*
+test/last-*.log
+test/last-*.html
+tmp/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# 别把带 Key 的备份传上来
+*.backup.js
+*.env

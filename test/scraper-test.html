@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>scraper 回归测试</title>
+<style>
+body{font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;margin:24px;color:#222}
+.fixture{border:1px dashed #ccd;background:#fbfcff;padding:10px;margin-bottom:16px}
+/* 主列宽、侧栏窄：宽度本身就是「侧栏兜底」判据的输入，别改成百分比五五开 */
+.layout{display:flex;gap:20px;align-items:flex-start}
+.job-list-box{flex:0 0 68%}
+/* 改版后的容器：class 认不得，但还占着主列那么宽 —— 兜底判据靠的就是这个宽度差 */
+.mystery-list{flex:0 0 68%}
+.side-col{flex:0 0 28%}
+.side-card{margin:8px 0}
+.side-mod{margin-bottom:12px}
+table{border-collapse:collapse;width:100%}
+th,td{border-bottom:1px solid #eee;padding:6px 8px;text-align:left;vertical-align:top}
+.pass{color:#1c8a45;font-weight:600}.fail{color:#c8402f;font-weight:600}
+.extra{color:#7a8698;font-size:12px;word-break:break-all}
+#sum{font-size:16px;margin:10px 0}
+</style></head>
+<body>
+<h3>BOSS 岗位抓取逻辑 · DOM 回归测试</h3>
+<div id="sum">运行中…</div>
+<table><thead><tr><th style="width:34%">断言</th><th style="width:8%">结果</th><th>实际值</th></tr></thead><tbody id="rows"></tbody></table>
+<h4>仿真 DOM（fixture）</h4>
+<div class="fixture" id="fixture">
+  <div class="layout">
+    <div class="job-list-box">
+      <div class="job-card-wrap"><div class="job-card-body"><div class="info-primary">
+        <div class="job-name"><a class="job-title-link" href="/job_detail/aaa111.html">Java 后端工程师</a></div>
+        <div class="salary-wrap"><span class="salary">20-35K·14薪</span></div>
+        <div class="company-wrap"><a class="company-name" href="/gongsi/beijing.html">北京某某网络科技有限公司</a></div>
+        <div class="company-location">海淀·中关村</div>
+        <div class="tag-list"><span>Java</span><span>Spring</span><span>五险一金</span></div>
+      </div></div></div>
+
+      <div class="job-card-wrap"><div class="job-card-body"><div class="info-primary">
+        <div class="job-name"><a class="job-title-link" href="/job_detail/bbb222.html">前端开发工程师（React）</a></div>
+        <div class="salary-wrap"><span class="salary">15-25K</span></div>
+        <div class="company-wrap"><a class="company-name" href="/gongsi/shanghai.html">上海某智能科技有限公司</a></div>
+        <div class="company-location">浦东·张江</div>
+        <div class="tag-list"><span>React</span><span>TypeScript</span></div>
+      </div></div></div>
+
+      <div class="job-card-wrap"><div class="job-card-body"><div class="info-primary">
+        <div class="job-name"><a class="job-title-link" href="/web/geek/job_detail?ccm=ccc333&amp;id=ccc333">数据平台研发</a></div>
+        <div class="salary-wrap"><span class="salary">25-50K·16薪</span></div>
+        <div class="company-line"><span>杭州某数据有限公司</span></div>
+        <div class="company-location">滨江·网商路</div>
+        <div class="tag-list"><span>Flink</span><span>数仓</span></div>
+      </div></div></div>
+
+      <div class="job-card-wrap no-salary"><div class="job-card-body"><div class="info-primary">
+        <div class="job-name"><a class="job-title-link" href="/job_detail/ddd444.html">运维工程师（面议）</a></div>
+        <div class="company-wrap"><a class="company-name" href="/gongsi/chengdu.html">成都某网络安全有限公司</a></div>
+      </div></div></div>
+
+      <!-- 收藏/感兴趣列表的真实写法：标题链接里把地点用方括号拼在后面。
+           混进标题会污染提示词，更会让沟通页的职位名比对失败（沟通页只有纯标题）。 -->
+      <div class="job-card-wrap"><div class="job-card-body"><div class="info-primary">
+        <div class="job-name"><a class="job-title-link" href="/job_detail/fff666.html">28届后端实习生-示例短视频 [ 上海·浦东新区 ]</a></div>
+        <div class="salary-wrap"><span class="salary">200-250元/天</span></div>
+        <div class="company-wrap"><a class="company-name" href="/gongsi/example.html">示例网络科技有限公司</a></div>
+      </div></div></div>
+    </div>
+
+    <!-- 真实收藏页右侧还有「谁看过我 / 对我感兴趣的」两块推荐。里面的岗位同样是
+         a[href*=job_detail]，旧版整页扫描会把它们一起抓进来（用户截图里打叉的那几条）。
+         侧栏比主列窄得多，而且有固定标题 —— 这两条线索就是下面两道路标。 -->
+    <div class="side-col">
+      <div class="side-mod">
+        <h3>谁看过我</h3>
+        <div class="side-card"><a class="job-title-link" href="/job_detail/side111.html">Golang 服务端开发（侧栏1）</a><div>10-15K</div></div>
+        <div class="side-card"><a class="job-title-link" href="/job_detail/side222.html">测试开发工程师（侧栏2）</a></div>
+      </div>
+      <div class="side-mod">
+        <h3>对我感兴趣的</h3>
+        <div class="side-card"><a class="job-title-link" href="/job_detail/side333.html">推荐算法工程师（侧栏3）</a></div>
+      </div>
+    </div>
+  </div>
+
+    <div class="page-wrap"><a class="next" href="#" aria-disabled="false">下一页</a></div>
+    <a class="noise" href="/web/geek/job?query=java&amp;position=100000">这是搜索页链接，不该被抓到</a>
+    <a class="noise2" href="/waimao/job_detail/eee555.html" style="display:none">隐藏卡片，不该算可见</a>
+</div>
+<script>
+(function () {
+  
+      var jobs = [];
+      var K = { jobs: 'jobs' };
+      function $$(s, r) { return Array.prototype.slice.call((r || document).querySelectorAll(s)); }
+      function $(s, r) { return (r || document).querySelector(s); }
+      function visible(el) { if (!el) return false; var b = el.getBoundingClientRect();
+        return b.width > 4 && b.height > 4 && el.offsetParent !== null && !el.disabled; }
+      function notMine(el) { return !(el.closest && el.closest('#bgPanel, #bgMin')); }
+      function log(msg) { (window.__logs = window.__logs || []).push(msg); }
+      function save() {} function renderJobs() {}
+      // v0.5.4：scrapeCurrentPage 不再 save(K.jobs, jobs) 整块盖，改叫 saveJobs()（读回存储、按 id
+      // 取并集）。并集本身在抽取区外面，由 ui-smoke ⑧ 钉着；这一层只钉「抓取确实走了那条路」。
+      function saveJobs() { window.__savedJobs = (window.__savedJobs || 0) + 1; }
+      function pruneDrafts() { window.__pruned = (window.__pruned || 0) + 1; }
+      function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+      function rnd(a, b) { return Math.floor(a + Math.random() * (b - a)); }
+      function clamp(s, n) { s = String(s || ''); return s.length > n ? s.slice(0, n) : s; }
+
+  // ---- 以下是从 .user.js 的 SCRAPER-BEGIN/END 之间原样切出的生产代码 ----
+  
+    function jobIdFromHref(href) {
+      const m = String(href || '').match(/(?:job_detail\/|[?&]id=)([A-Za-z0-9_%.-]+)/);
+      return m ? m[1].replace(/\.html?$/i, '') : '';
+    }
+  
+    // 找「一张卡片」的最小容器：往上走，但一旦包含第二张岗位卡或文本超限就回退，
+    // 避免把整个列表当成一条岗位。
+    function findCard(a) {
+      let cur = a, prev = a;
+      for (let i = 0; i < 8 && cur.parentElement; i++) {
+        cur = cur.parentElement;
+        const links = $$('a[href*="job_detail"], a[href*="/job/"]', cur).length;
+        const txt = cur.innerText || '';
+        if (links > 1 || txt.length > 460) return prev;
+        prev = cur;
+        if (txt.length > 110 && /\d\s*[-~—]\s*\d/.test(txt)) return cur;
+      }
+      return prev;
+    }
+  
+    const SALARY_RE = /(\d+(?:\.\d+)?)\s*[-~—]\s*(\d+(?:\.\d+)?)(\s*[Kk千万]|\/\s*月)?(\s*[·]?\s*\d+\s*个月?)?/;
+    const CITY_RE = /[一-龥]{2,8}\s*[-·]\s*[一-龥]{2,8}/;
+  
+    function pickCompany(lines, title) {
+      const cand = lines.filter((s) => s !== title && s.length <= 30 && !/^\d/.test(s) &&
+        /(公司|集团|有限|股份|银行|研究院|科技|网络|信息)/.test(s));
+      return cand.find((s) => /(公司|有限|集团|银行)$/.test(s)) || cand[0] || '';
+    }
+  
+    // 标签不从 innerText 的行里取：同一行的多个 span 会被合并成一坨（如 JavaSpring五险一金）
+    function pickTags(card, title, company, salary) {
+      const out = [];
+      $$('span, li, em, i, div', card).forEach((e) => {
+        if (e.children.length) return;
+        const t = (e.innerText || '').trim();
+        if (!t || t.length > 14) return;
+        if (t === title || t === company || t === salary) return;
+        if (/^\d|^\s*[-~—·]/.test(t)) return;
+        if (CITY_RE.test(t)) return;
+        if (out.indexOf(t) < 0) out.push(t);
+      });
+      return out.slice(0, 10);
+    }
+  
+    // 收藏/感兴趣列表的标题常写成「28届后端实习生-示例短视频 [ 上海·浦东新区 ]」。括号那截是地点：
+    // 混进标题既污染给大模型的提示词，又会让沟通页的职位名比对失败（沟通页只渲染纯标题），
+    // 实测用户日志里那句「沟通页认不出当前会话是这个岗位」就是这么来的。
+    const LOC_TAIL = /\s*[[（(【]\s*([^()（）[\]【】]{2,40}?)\s*[\]）)】]\s*$/;
+    function splitTitleLoc(t) {
+      const s = String(t || '').trim();
+      const m = s.match(LOC_TAIL);
+      if (!m) return { title: s, loc: '' };
+      const inner = m[1];
+      // 方括号是 BOSS 放地点的写法（[ 上海·浦东新区 ]），圆括号多半是限定语（（实习）），
+      // 所以只有圆括号那种要看到「市/区/·」才认，方括号短中文也认。
+      const square = /[\[【]/.test(m[0]);
+      const looksLoc = /[·\-—]/.test(inner) || /(市|区|县|州|镇|街道)/.test(inner) ||
+        (square && /^[一-龥]{2,8}$/.test(inner));
+      if (!looksLoc) return { title: s, loc: '' };
+      return { title: s.replace(LOC_TAIL, '').replace(/\s{2,}/g, ' ').trim(), loc: inner.replace(/\s+/g, '') };
+    }
+  
+    function parseJobCard(a) {
+      const card = findCard(a);
+      const raw = (card.innerText || '').split('\n').map((s) => s.trim()).filter(Boolean);
+      const st = splitTitleLoc((a.innerText || a.getAttribute('title') || '').replace(/\s+/g, ' ').trim() || raw[0] || '');
+      const title = st.title;
+      const joined = raw.join(' | ');
+      const salary = (joined.match(SALARY_RE) || [])[0] || '';
+      const compA = $$('a', card).find((x) => /company|gongsi/i.test(x.href || '') && x.innerText.trim().length > 1);
+      const company = compA ? compA.innerText.replace(/\s+/g, ' ').trim() : pickCompany(raw, title);
+      // 标题尾巴上明确写着地点时优先信它：正文里的「市/区·短语」启发式很容易先咬到
+      // 「实习-示例短视频」这种假城市（两段汉字中间一个连字符就算命中了）
+      const city = st.loc || (joined.match(CITY_RE) || [])[0] || '';
+      const tags = pickTags(card, title, company, salary);
+      return {
+        id: jobIdFromHref(a.href) || (title + '|' + company),
+        title: title,
+        company: company,
+        salary: salary,
+        city: city,
+        tags: tags,
+        url: a.href.split('?')[0],
+        text: raw.join('\n'),
+        ts: Date.now()
+      };
+    }
+  
+    // 收藏/感兴趣页的主列卡片都在 .job-list-box 里；右侧「谁看过我 / 对我感兴趣的」是独立模块，
+    // 里面的岗位同样是 a[href*=job_detail]，旧版整页扫描会把它们一起抓进来（用户截图里打叉的那几条）。
+    // 先认主列表容器；认不出来时再用「侧栏标题」和「卡片宽度」两道过滤兜底，宁可少抓也不乱抓。
+    const JOB_HREF_RE = /job_detail|jobDetail|\/job\//;
+    const JOB_LIST_SCOPE_SELS = [
+      ['.job-list-box', '[class*="job-list-box"]'],
+      ['[class*="job-list-container"]', '[class*="job-list-wrap"]'],
+      ['[class*="job-list"]']
+    ];
+    const SIDE_HEAD_RE = /^(谁看过我|对我感兴趣的)$/;
+  
+    function isJobHref(href) { return JOB_HREF_RE.test(String(href || '')); }
+  
+    // 从标题往上找到第一个装着岗位链接的窄容器：右侧两个推荐模块都是这个形状。
+    // 只收窄的（< 55% 视口宽），防止把标题所在的整页大容器误判成侧栏。
+    function sidebarRoots() {
+      const out = [];
+      const heads = $$('h1, h2, h3, h4, h5, strong, span, div, p')
+        .filter((e) => {
+          const t = (e.innerText || '').trim();
+          return t.length >= 4 && t.length <= 12 && SIDE_HEAD_RE.test(t) && visible(e) && notMine(e);
+        });
+      heads.forEach((h) => {
+        let cur = h;
+        for (let i = 0; i < 8 && cur.parentElement; i++) {
+          cur = cur.parentElement;
+          if (!$$('a', cur).some((a) => isJobHref(a.href))) continue;
+          if (cur.getBoundingClientRect().width < window.innerWidth * 0.55 &&
+              !out.some((r) => r === cur || r.contains(cur))) out.push(cur);
+          break;
+        }
+      });
+      return out;
+    }
+  
+    // 主列表容器：按精确度分三档找，找到哪一档就只用哪一档的链接。
+    // 宽度 < 45% 视口的不算主列（右侧推荐模块即使 class 里带 job-list 也不会被当成主列表）。
+    function mainListRoots(sideRoots) {
+      for (const sels of JOB_LIST_SCOPE_SELS) {
+        const out = [];
+        sels.forEach((sel) => {
+          $$(sel).forEach((root) => {
+            if (!visible(root)) return;
+            if (root.getBoundingClientRect().width < Math.min(420, window.innerWidth * 0.45)) return;
+            if (sideRoots.some((s) => s.contains(root))) return;
+            if (!$$('a', root).some((a) => isJobHref(a.href) && visible(a) && notMine(a))) return;
+            if (!out.some((r) => r === root || r.contains(root))) out.push(root);
+          });
+        });
+        if (out.length) return out;
+      }
+      return [];
+    }
+  
+    function jobLinksIn(roots) {
+      const out = [];
+      roots.forEach((root) => { $$('a', root).forEach((a) => { if (isJobHref(a.href)) out.push(a); }); });
+      return out;
+    }
+  
+    function scrapeCurrentPage(silent) {
+      const seen = {};
+      const found = [];
+      const side = sidebarRoots();
+      const roots = mainListRoots(side);
+      // 认得出主列表就只扫主列表；认不出才退回整页，但下面会按侧栏标题和卡片宽度再筛。
+      let links = roots.length ? jobLinksIn(roots) : $$('a').filter((a) => isJobHref(a.href));
+      links = links.filter((a) => {
+        if (!notMine(a) || !visible(a)) return false;
+        if (!isJobHref(a.href)) return false;
+        if (side.some((r) => r.contains(a))) return false;
+        const t = (a.innerText || '').trim();
+        return t.length >= 2 && t.length <= 80;
+      });
+      // 没认出主列表容器时的兜底：侧栏卡片窄得多，主列卡片宽。
+      // 以本页最宽卡片的 55% 为界，同时不低于 320px；正常窗口里主列一定过线。
+      let droppedNarrow = 0;
+      if (!roots.length && links.length) {
+        const widths = links.map((a) => {
+          try { return findCard(a).getBoundingClientRect().width; } catch (e) { return 0; }
+        });
+        const maxW = Math.max.apply(null, widths.concat([0]));
+        const minW = Math.max(320, maxW * 0.55);
+        links = links.filter((a, i) => {
+          const keep = widths[i] >= minW;
+          if (!keep) droppedNarrow++;
+          return keep;
+        });
+      }
+      links.forEach((a) => {
+        const id = jobIdFromHref(a.href);
+        if (!id || seen[id]) return;
+        seen[id] = 1;
+        try { found.push(parseJobCard(a)); } catch (e) { /* 跳过脏节点 */ }
+      });
+      if (!silent && (side.length || droppedNarrow)) {
+        log('· 本页只取职位收藏主列表' + (roots.length ? '' : '（没认出主列表容器，按侧栏标题/卡片宽度过滤）') +
+          (droppedNarrow ? '，排除 ' + droppedNarrow + ' 个侧栏窄卡片' : '') +
+          (side.length ? '，已忽略「谁看过我 / 对我感兴趣的」侧栏' : ''));
+      }
+      let added = 0;
+      // 记下「这张卡片是在哪个列表页看到的」：发送时可以直接在那个列表页上点卡片自己的沟通按钮
+      // （见 sendViaListTab），不必再开一次详情页。翻页时 URL 不变，所以同一 URL 下滚动能找到就行。
+      const pageUrl = location.href.split('#')[0];
+      found.forEach((j) => {
+        j.listUrl = pageUrl;
+        const exist = jobs.findIndex((x) => x.id === j.id);
+        if (exist >= 0) { jobs[exist] = Object.assign(jobs[exist], j); }   // 保留已有的 sel，别把用户的取消勾选冲掉
+        // v0.5.1：新抓到的岗位默认**不**进队列。收藏列表里往往躺着几十条早就没兴趣的岗位，
+        // 一抓就全塞进队列，等于逼着脚本给每一条都开一个后台标签抓 JD（慢、吃限流），
+        // 也逼着用户去队列里一条条取消。现在改成「抓回来只是入库，勾上才算要处理」，
+        // 详情抓取跟着勾选走（见 planDetails）。
+        else { j.sel = false; jobs.push(j); added++; }
+      });
+      saveJobs();
+      pruneDrafts();
+      if (!silent) log('本页识别到 ' + found.length + ' 个岗位，新增 ' + added + ' 个（累计 ' + jobs.length + '）；' +
+        '新岗位默认未勾选 —— 去「岗位」页勾上才进队列，勾上时缺 JD 的会自动去后台抓');
+      renderJobs();
+      return added;
+    }
+  
+    async function scrapeWithPagination(maxPages) {
+      log('开始翻页抓取，最多 ' + maxPages + ' 页');
+      let lastCount = -1;
+      for (let p = 0; p < maxPages; p++) {
+        const n = scrapeCurrentPage(true);
+        log('第 ' + (p + 1) + ' 页新增 ' + n + ' 个，累计 ' + jobs.length);
+        const before = jobs.length;
+        const btn = findNextButton();
+        if (!btn) { log('没找到下一页按钮，停止翻页'); break; }
+        btn.click();
+        const t0 = Date.now();
+        while (Date.now() - t0 < 8000) {
+          await sleep(500);
+          if (jobs.length !== before) break;
+        }
+        if (jobs.length === before) { log('翻页后无新增，停止'); break; }
+        await sleep(rnd(1500, 3200));
+        if (jobs.length === lastCount) { log('内容未变化，停止'); break; }
+        lastCount = jobs.length;
+      }
+      renderJobs();
+    }
+  
+    function findNextButton() {
+      const byClass = $$('[class*="next"] button, button.next, a.next, .ui-icon-chevronright, [class*="pagination"] [class*="next"]');
+      for (const el of byClass) {
+        if (visible(el) && !/disabled/i.test(el.className + ' ' + (el.getAttribute('aria-disabled') || ''))) return el;
+      }
+      const byText = $$('button, a, span, li').filter((e) => visible(e) && /^(下一页|下页|>)$/.test((e.innerText || '').trim()));
+      return byText[0] || null;
+    }
+    
+  window.__X = { scrapeCurrentPage: scrapeCurrentPage, findNextButton: findNextButton, parseJobCard: parseJobCard, jobIdFromHref: jobIdFromHref, get jobs() { return jobs; } };
+  
+        window.__run = function () {
+          var out = [];
+          var add = function (name, pass, extra) { out.push({ name: name, pass: !!pass, extra: extra === undefined ? '' : String(extra) }); };
+  
+          window.__X.scrapeCurrentPage();
+          var js = window.__X.jobs;
+          var logs = (window.__logs || []).join('\n');
+          var byTitle = function (t) { return js.filter(function (x) { return x.title.indexOf(t) >= 0; })[0] || {}; };
+  
+          add('抓到 5 个岗位（含 1 个面议 + 1 个收藏列表写法）', js.length === 5, '实际 ' + js.length + '：' + js.map(function (j) { return j.title; }).join(' / '));
+          add('忽略搜索页链接 /web/geek/job?query=', js.every(function (j) { return !/job\?/.test(j.url); }), js.map(function (j) { return j.url; }).join(' '));
+  
+          // 用户图2打叉的那几条：右侧「谁看过我 / 对我感兴趣的」里也有 a[href*=job_detail]，
+          // 旧版整页扫 a 标签，把它们当成收藏岗位一起抓了。现在只认主列表容器。
+          add('右侧「谁看过我 / 对我感兴趣的」里的岗位一条都没抓',
+            js.every(function (j) { return !/（侧栏\d）/.test(j.title) && !/^side/.test(j.id); }),
+            js.map(function (j) { return j.id + ':' + j.title; }).join(' / '));
+          add('日志说清只取职位收藏主列表、忽略了右侧推荐',
+            /本页只取职位收藏主列表/.test(logs) && /已忽略「谁看过我 \/ 对我感兴趣的」侧栏/.test(logs),
+            (logs.match(/[^\n]*主列表[^\n]*/) || ['无'])[0]);
+  
+          var j1 = byTitle('Java 后端');
+          add('标题正确', j1.title === 'Java 后端工程师', j1.title);
+          add('薪资正确', /20-35K/.test(j1.salary || ''), j1.salary);
+          add('公司正确', /某某网络科技/.test(j1.company || ''), j1.company);
+          add('城市正确', /海淀·中关村/.test(j1.city || ''), j1.city);
+          add('标签含 Spring', (j1.tags || []).indexOf('Spring') >= 0, (j1.tags || []).join(','));
+          add('标签未被合并成串', (j1.tags || []).every(function (t) { return !/JavaSpring/.test(t); }), (j1.tags || []).join(','));
+          add('岗位之间文本不串味', !/前端开发/.test(j1.text || ''), clamp(j1.text, 120));
+  
+          var j3 = byTitle('数据平台');
+          add('id 型链接解析出 id', j3.id === 'ccc333', j3.id);
+          add('无公司链接时从文本取公司', /某数据有限公司/.test(j3.company || ''), j3.company);
+  
+          var j4 = byTitle('运维');
+          add('面议岗位仍入库', !!j4.title, JSON.stringify({ t: j4.title, s: j4.salary }));
+  
+          // 收藏/感兴趣列表把地点用方括号拼在标题里：混进标题会污染提示词，
+          // 更会让沟通页的职位名比对失败（沟通页只渲染纯标题）—— 用户日志里那句「认不出当前会话」的根因。
+          var j5 = byTitle('示例短视频');
+          add('收藏列表的标题会剥掉尾部地点括号', j5.title === '28届后端实习生-示例短视频', JSON.stringify(j5.title));
+          add('剥下来的地点回填到城市，信息不丢', /上海·浦东新区/.test(j5.city || ''), j5.city);
+          add('岗位 id 不受标题清洗影响', j5.id === 'fff666', j5.id);
+          add('圆括号里的限定语不当地点（（面议）/（React）原样保留）',
+            j4.title === '运维工程师（面议）' && byTitle('前端开发工程师').title === '前端开发工程师（React）',
+            JSON.stringify([j4.title, byTitle('前端开发工程师').title]));
+  
+          var nb = window.__X.findNextButton();
+          add('找到下一页按钮', !!nb && /next/.test(nb.className), nb ? nb.className : 'null');
+          add('id 去重', js.length === new Set(js.map(function (j) { return j.id; })).size, js.map(function (j) { return j.id; }).join(','));
+  
+          // 选中状态 = 队列成员资格。v0.5.1：抓回来只是入库、默认不勾选（勾上才进队列、才自动抓详情），
+          // 而重抓既不能把用户勾上的抹掉，也不能把没勾的塞进队列。
+          add('新抓到的岗位默认不勾选（抓回来只是入库，勾上才算要处理）', js.length > 0 && js.every(function (j) { return j.sel === false; }),
+            js.map(function (j) { return j.sel; }).join(','));
+          add('抓取后清了孤儿草稿', (window.__pruned || 0) >= 1, 'pruneDrafts 调用 ' + (window.__pruned || 0) + ' 次');
+          add('抓取后按并集写回岗位列表（走 saveJobs 那条路，不再整块盖别人的岗位）',
+            (window.__savedJobs || 0) >= 1, 'saveJobs 调用 ' + (window.__savedJobs || 0) + ' 次');
+          js[0].sel = true;   // 模拟用户勾了第一条，其余保持没勾
+          var addedAgain = window.__X.scrapeCurrentPage(true);
+          add('重抓同一页不产生重复岗位', window.__X.jobs.length === js.length && addedAgain === 0,
+            '累计 ' + window.__X.jobs.length + '，本次新增 ' + addedAgain);
+          add('重抓不抹掉用户勾上的、也不把没勾的塞进队列',
+            window.__X.jobs[0].sel === true && window.__X.jobs.slice(1).every(function (j) { return j.sel === false; }),
+            window.__X.jobs.map(function (j) { return j.sel; }).join(','));
+          add('重抓会刷新岗位文本/薪资', !!window.__X.jobs[0].title && window.__X.jobs[0].id === js[0].id, window.__X.jobs[0].title);
+  
+          // 站点改版、主列表 class 认不出来：退回整页扫 a 标签，但「卡片宽度」这道兜底必须把侧栏窄卡片挡掉。
+          // 宁可少抓，也不能像旧版那样把右侧推荐混进来。新塞的「猜你喜欢」故意不叫「谁看过我」，
+          // 这样侧栏标题那道闸门帮不上忙，只有宽度判据能挡住它。
+          document.querySelector('.job-list-box').className = 'mystery-list';
+          document.querySelector('.side-col').insertAdjacentHTML('beforeend',
+            '<div class="guess-mod"><h3>猜你喜欢</h3><div class="side-card">' +
+            '<a class="job-title-link" href="/job_detail/side999.html">云原生开发工程师（猜你喜欢）</a></div></div>');
+          var logMark = (window.__logs || []).length;
+          var addedFB = window.__X.scrapeCurrentPage();
+          var fbLog = (window.__logs || []).slice(logMark).join('\n');
+          add('认不出主列表容器时按卡片宽度兜底：主列 5 条照常在，侧栏窄卡片一条不进',
+            addedFB === 0 && window.__X.jobs.length === 5 &&
+            !window.__X.jobs.some(function (j) { return j.id === 'side999'; }),
+            '新增 ' + addedFB + '，累计 ' + window.__X.jobs.length + '：' + window.__X.jobs.map(function (j) { return j.id; }).join(','));
+          add('兜底路径在日志里说明白（没认出容器、按宽度排除了几张）',
+            /按侧栏标题\/卡片宽度过滤/.test(fbLog) && /排除 1 个侧栏窄卡片/.test(fbLog),
+            (fbLog.match(/[^\n]*主列表[^\n]*/) || ['无'])[0]);
+          return out;
+        };
+  
+  var res = [];
+  try { res = window.__run(); }
+  catch (e) { res.push({ name: '测试执行自身抛错', pass: false, extra: (e && e.message) + ' @ ' + String((e && e.stack) || '').split(String.fromCharCode(10))[1] }); }
+  window.__RESULT = { total: res.length, failed: res.filter(function (r) { return !r.pass; }).length, detail: res };
+  document.getElementById('rows').innerHTML = res.map(function (r) {
+    return '<tr><td>' + r.name + '</td><td class="' + (r.pass ? 'pass">PASS' : 'fail">FAIL') + '</td><td class="extra">' +
+      String(r.extra).replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</td></tr>';
+  }).join('');
+  var bad = window.__RESULT.failed;
+  document.getElementById('sum').innerHTML = bad ? '<span class="fail">' + bad + ' 项失败</span> / 共 ' + res.length + ' 项' :
+    '<span class="pass">全部 ' + res.length + ' 项通过</span>';
+})();
+</script>
+</body></html>

@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         BOSS直聘 · 收藏岗位大模型打招呼助手
-// @namespace    qoder.boss.greet.assistant
-// @version      0.5.9
-// @description  读取网页版 BOSS 直聘收藏的岗位，连同本地简历一起交给大模型生成个性化打招呼语，再半自动/自动发送给 HR
+// @name         BOSS直聘 · 岗位筛选与打招呼助手
+// @namespace    qoder.boss.assistant
+// @version      0.7.1
+// @description  两部分功能：(1) 按城市/薪资/时长/出勤/招聘者活跃度/简历匹配度自动筛选并收藏岗位；(2) 读取收藏的岗位，连同本地简历一起交给大模型生成个性化打招呼语，再半自动/自动发送给 HR
 // @match        https://www.zhipin.com/*
 // @match        https://*.zhipin.com/*
 // @run-at       document-idle
@@ -28,16 +28,26 @@
 /*
  * 安装：Edge/Chrome 装 Tampermonkey -> 新建脚本 -> 粘贴本文件 -> Ctrl+S
  * 注意：IE 无法运行（油猴没有 IE 版本，BOSS 直聘网页版也不支持 IE），必须用 Edge 或 Chrome。
- * 首次使用顺序：1) 设置里填 API  2) 简历里选 PDF 或粘文本  3) 打开「收藏」页点「抓当前页」
- *             —— 抓完会自动开后台标签逐个进详情页把 JD 捞回来（「设置 > 发送策略」可关）
- *             4) 队列里生成 -> 发送
+ *
+ * v0.7.0 两部分功能：
+ *   第一部分【筛选】：在「筛选」tab 配置城市/口径/目标数，打开 BOSS 实习列表页后点「开始筛选当前页」
+ *                    或「批量筛选所有城市」，脚本自动按日薪/时长/出勤/招聘者活跃度/简历匹配度过滤，
+ *                    合格的点收藏，不合格的跳过并记录原因。
+ *   第二部分【打招呼】：在「岗位」tab 抓取收藏的岗位 → 「队列」tab 生成招呼语 → 发送。
+ *
+ * 首次使用顺序：
+ *   1) 「设置」tab 填 API Key / Model
+ *   2) 「简历」tab 选 PDF 或粘文本
+ *   3) 「筛选」tab 配置城市与口径，开始筛选并收藏
+ *   4) 收藏完成后，去「岗位」tab 抓当前页（BOSS 收藏列表页）
+ *   5) 勾上要处理的岗位 → 「队列」tab 生成 → 发送
  */
 (function () {
   'use strict';
 
   // 版本号跟上面 @version 保持一致：面板标题和启动日志都会打出来，
   // 方便确认「油猴里跑的到底是哪一版」（改完脚本忘了替换是最常见的坑）。
-  const VER = '0.5.9';
+  const VER = '0.7.1';
 
   /* ---------------------------------------------------------------- 配置存储 */
 
@@ -52,7 +62,11 @@
     batch: 'bgBatch',       // 正在跑的批量计划（整页跳转后新页面靠它接着跑）
     logbuf: 'bgLogBuf',     // 日志在油猴存储里的那份副本（整页跳转不会把历史留在内存里）
     exec: 'bgExec',         // 面板递给「生成器」标签页的交接单（跑哪几条、被谁认领了）
-    execLog: 'bgLogExec'    // 生成器那一页自己的日志副本（和面板那份分开，两边不互相盖）
+    execLog: 'bgLogExec',   // 生成器那一页自己的日志副本（和面板那份分开，两边不互相盖）
+    // v0.7.0 筛选功能新增
+    scoutCfg: 'scoutCfg',   // 筛选配置（城市、口径、目标数）
+    scoutProgress: 'scoutProgress', // 筛选进度（已收藏、已跳过、当前状态）
+    scoutReport: 'scoutReport'      // 筛选报告（本轮收藏的岗位清单）
   };
   // 「这条岗位真的发出去了」的持久凭证。发送成功的确认方可能是后台那个标签页，
   // 而把草稿标成「已发送」的是面板这一页 —— 面板半路被跳转销毁时，标记就丢了，
@@ -117,7 +131,7 @@
     delayMax: 22000,
     maxPerDay: 20,
     autoSend: false,          // false = 半自动（面板里人工确认）
-    autoOpenChat: false,      // true  = 自动点「立即沟通」再发送
+    autoOpenChat: true,       // true  = 自动点「立即沟通」再发送
     sendViaList: true,        // 发送优先在后台标签的「列表页卡片」上点沟通入口（少开一次详情页）；走不通自动退回详情页入口
     autoCloseDetail: true,    // 抓完详情自动关掉那个后台标签页
     autoFetchDetail: true,    // 抓完列表自动开后台标签进详情页抓 JD（没 JD 的岗位不会生成招呼语）
@@ -127,8 +141,808 @@
     pdfTimeoutMs: 25000       // 单种 worker 方案的最长耗时，超时自动换下一条路（避免静默卡死）
   };
 
+  /* ============ v0.7.1：薪资字体混淆破解 ============
+   * BOSS直聘使用自定义字体（kanzhun-Regular/kanzhun-mix）混淆薪资数字：
+   * DOM 中包含 Unicode 私有区字符（PUA），如  (U+E0B2 U+E0B6 U+E0B1) = 261
+   * 字体将这些字符渲染为数字字形。
+   * 解决方案：解码 PUA 字符为真实数字。
+   */
+  
+  // PUA 字符到数字的映射（基于观察：U+E0B0=0, U+E0B1=1, ..., U+E0B9=9）
+  // 注意：实际编码范围可能不同，需要动态检测
+  const PUA_TO_DIGIT = {};
+  
+  // 初始化映射（覆盖常见 PUA 数字范围）
+  for (let i = 0; i <= 9; i++) {
+    // 尝试多个可能的范围
+    const ranges = [0xE000, 0xE010, 0xE020, 0xE030, 0xE040, 0xE050, 0xE060, 0xE070, 0xE080, 0xE090, 0xE0A0, 0xE0B0, 0xE0C0, 0xE0D0, 0xE0E0, 0xE0F0];
+    for (const base of ranges) {
+      PUA_TO_DIGIT[String.fromCharCode(base + i)] = String(i);
+    }
+  }
+
+  // 解码 PUA 字符为真实数字
+  function decodePUASalary(text) {
+    if (!text) return text;
+    
+    // 调试：记录 PUA 字符的实际编码
+    const puaChars = text.match(/[\uE000-\uE0FF]/g);
+    if (puaChars && puaChars.length > 0) {
+      const codeInfo = puaChars.slice(0, 10).map(ch => {
+        const code = ch.charCodeAt(0);
+        const lastDigit = code & 0xF;
+        const realDigit = (lastDigit - 1 + 10) % 10;
+        return `${ch}(U+${code.toString(16).toUpperCase().padStart(4,'0')}, last=${lastDigit}→${realDigit})`;
+      }).join(', ');
+      log('[SalaryAPI] PUA codes: ' + codeInfo);
+    }
+    
+    // 替换所有 PUA 字符（U+E000-U+E0FF）
+    // 映射规律：实际数字 = (last_hex_digit - 1 + 10) % 10
+    return text.replace(/[\uE000-\uE0FF]/g, (ch) => {
+      const code = ch.charCodeAt(0);
+      const lastDigit = code & 0xF;
+      const realDigit = (lastDigit - 1 + 10) % 10;
+      return String(realDigit);
+    });
+  }
+
+  const salaryCache = new Map();  // jobId -> { low, high, unit }
+
+  // 从 API 响应中提取薪资数据
+  function extractSalaryFromResponse(url, data) {
+    try {
+      // 岗位列表 API
+      if (url.includes('/wapi/zpgeek/search/joblist.json') || url.includes('/web/geek/job')) {
+        const jobs = data?.zpData?.jobList || data?.data?.jobList || [];
+        for (const job of jobs) {
+          if (job.encId || job.jobId) {
+            const id = job.encId || job.jobId;
+            if (job.salaryDesc) {
+              // salaryDesc 格式: "150-170元/天" 或 "15-20K" 等
+              const m = /(\d+(?:\.\d+)?)\s*[-~—]\s*(\d+(?:\.\d+)?)/.exec(job.salaryDesc);
+              if (m) {
+                salaryCache.set(id, {
+                  low: parseFloat(m[1]),
+                  high: parseFloat(m[2]),
+                  unit: job.salaryDesc.includes('天') ? 'day' : (job.salaryDesc.includes('月') ? 'month' : 'unknown'),
+                  raw: job.salaryDesc
+                });
+              }
+            }
+          }
+        }
+      }
+      // 岗位详情 API
+      else if (url.includes('/wapi/zpgeek/job/detail.json') || url.includes('/job_detail')) {
+        const job = data?.zpData?.jobInfo || data?.data?.jobInfo || {};
+        if (job.encId || job.jobId) {
+          const id = job.encId || job.jobId;
+          if (job.salaryDesc) {
+            const m = /(\d+(?:\.\d+)?)\s*[-~—]\s*(\d+(?:\.\d+)?)/.exec(job.salaryDesc);
+            if (m) {
+              salaryCache.set(id, {
+                low: parseFloat(m[1]),
+                high: parseFloat(m[2]),
+                unit: job.salaryDesc.includes('天') ? 'day' : (job.salaryDesc.includes('月') ? 'month' : 'unknown'),
+                raw: job.salaryDesc
+              });
+            }
+          }
+        }
+      }
+    } catch (e) {
+      log('[SalaryAPI] Error: ' + e.message);
+    }
+  }
+
+  // 拦截 fetch 请求（使用 unsafeWindow 访问页面的真实 fetch）
+  const originalFetch = unsafeWindow.fetch;
+  unsafeWindow.fetch = function(...args) {
+    const url = String(args[0] || '');
+    return originalFetch.apply(this, args).then((response) => {
+      if (url.includes('zhipin.com') && (url.includes('joblist') || url.includes('job/detail'))) {
+        log('[SalaryAPI] fetch matched: ' + url);
+        response.clone().json().then((data) => {
+          extractSalaryFromResponse(url, data);
+        }).catch((e) => log('[SalaryAPI] fetch json error: ' + e.message));
+      }
+      return response;
+    });
+  };
+
+  // 拦截 XMLHttpRequest（使用 unsafeWindow 访问页面的真实 XHR）
+  const originalXHROpen = unsafeWindow.XMLHttpRequest.prototype.open;
+  const originalXHRSend = unsafeWindow.XMLHttpRequest.prototype.send;
+  unsafeWindow.XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+    this._url = String(url || '');
+    return originalXHROpen.apply(this, [method, url, ...rest]);
+  };
+  unsafeWindow.XMLHttpRequest.prototype.send = function(...args) {
+    this.addEventListener('load', function() {
+      if (this._url && this._url.includes('zhipin.com') &&
+          (this._url.includes('joblist') || this._url.includes('job/detail'))) {
+        log('[SalaryAPI] XHR matched: ' + this._url);
+        try {
+          const data = JSON.parse(this.responseText);
+          extractSalaryFromResponse(this._url, data);
+        } catch (e) {
+          log('[SalaryAPI] XHR parse error: ' + e.message);
+        }
+      }
+    });
+    return originalXHRSend.apply(this, args);
+  };
+
+  // 从缓存获取薪资（优先使用 API 数据，降级使用 DOM 文本）
+  function getSalaryForJob(jobId, domSalaryText) {
+    log('[SalaryAPI] getSalaryForJob, jobId: ' + jobId + ', cache size: ' + salaryCache.size);
+    const cached = salaryCache.get(jobId);
+    if (cached) {
+      log('[SalaryAPI] Cache hit: ' + jobId + ' -> ' + cached.raw);
+      return cached.raw;  // 返回真实薪资字符串
+    }
+    log('[SalaryAPI] Cache miss: ' + jobId + ', using DOM: ' + domSalaryText);
+    return domSalaryText;  // 降级使用 DOM 文本（可能被混淆）
+  }
+
+  /* ============ v0.7.0：岗位筛选功能（第一部分：筛选并收藏） ============
+   * 基于 boss-intern-scout 插件的筛选口径，在油猴脚本里实现：
+   * - 在 BOSS 实习列表页自动筛选符合要求的岗位
+   * - 点击收藏按钮
+   * - 记录筛选报告（通过/跳过/原因）
+   * 筛选口径（硬性，按顺序判）：
+   * 1. 时长 ≤3 个月
+   * 2. 平均日薪 ≥200（中值计算）
+   * 3. 出勤 ≤5 天/周
+   * 4. 招聘者状态：在线/今日活跃/昨日活跃
+   * 5. 简历匹配度（关键词命中）
+   * 6. 无硬伤（届别/院校/方向/经验/时长）
+   */
+
+  // 筛选默认配置
+  const SCOUT_DEFAULTS = {
+    // 目标城市与 URL
+    cities: [
+      { name: '北京', code: '101010100' },
+      { name: '上海', code: '101020100' },
+      { name: '杭州', code: '101210100' },
+      { name: '武汉', code: '101200100' }
+    ],
+    currentCity: 0,           // 当前处理的城市索引
+    targetCount: 20,          // 目标收藏数
+    // 筛选口径
+    maxMonths: 3,             // 实习时长上限（月）
+    minDailySalary: 200,      // 最低日薪（中值）
+    maxDaysPerWeek: 5,        // 每周出勤上限
+    // HR 活跃度筛选（勾选的才通过）
+    hrActiveStatus: ['在线', '刚刚活跃', '今日活跃', '昨日活跃', '3日内活跃', '本周活跃'],
+    // 招聘者活跃度（按优先级排序）
+    recruiterStatus: ['在线', '今日活跃', '昨日活跃'],
+    recruiterStatusSoft: ['刚刚活跃', '最新活跃'],  // 可用但需标注
+    // 简历关键词（两条线）
+    javaKeywords: ['Spring', 'SpringBoot', 'SpringBoot', 'Spring Cloud', 'MyBatis', 'Redis', 'MySQL', 'MQ', 'Kafka', 'Elasticsearch', '微服务', 'JVM', '分布式', 'Java'],
+    aiKeywords: ['LangGraph', 'LangChain', 'RAG', 'Agent', 'Prompt', 'Function Calling', '向量', 'Milvus', 'Qdrant', 'pgvector', 'FastAPI', 'SSE', '大模型', 'AI'],
+    // 硬伤关键词
+    hardInjuries: ['2027届', '2026届', '27届', '26届', '985', '211', '双一流', '硕士', '博士', 'C++', '算法研究', '纯前端', '硬件', '嵌入式', '测试'],
+    // 运行控制
+    autoScroll: true,         // 自动滚动加载更多
+    maxScrollTimes: 10,       // 最多滚动次数
+    delayBetweenActions: 1500 // 操作间隔（毫秒，防风控）
+  };
+
+  // 筛选运行时状态
+  let scoutCfg = load(K.scoutCfg, SCOUT_DEFAULTS);
+  scoutCfg = Object.assign({}, SCOUT_DEFAULTS, scoutCfg || {});
+  let scoutProgress = load(K.scoutProgress, { favorited: [], skipped: [], running: false, paused: false, currentIndex: 0, currentJobId: '' });
+  let scoutReport = load(K.scoutReport, []);
+
+  function saveScoutCfg() { save(K.scoutCfg, scoutCfg); }
+  function saveScoutProgress() { save(K.scoutProgress, scoutProgress); }
+  function saveScoutReport() { save(K.scoutReport, scoutReport); }
+
+  /* ---------------- 筛选核心逻辑 ---------------- */
+
+  // 从卡片文本中解析实习时长（月）
+  function parseDuration(text) {
+    const m = /(\d+)\s*个月/.exec(text || '');
+    return m ? parseInt(m[1], 10) : -1;
+  }
+
+  // 从薪资文本中解析日薪中值
+  function parseDailySalary(salary) {
+    if (!salary) return 0;
+    const m = /(\d+)\s*[-~—]\s*(\d+)/.exec(salary);
+    if (!m) return 0;
+    const low = parseInt(m[1], 10), high = parseInt(m[2], 10);
+    return Math.floor((low + high) / 2);
+  }
+
+  // 从卡片文本中解析每周出勤天数
+  function parseDaysPerWeek(text) {
+    const m = /(\d+)\s*天\s*[\/每]/.exec(text || '');
+    return m ? parseInt(m[1], 10) : 7;  // 没找到就假设 7 天（最严格）
+  }
+
+  // 判断招聘者状态是否合格
+  function isRecruiterActive(text) {
+    const t = text || '';
+    // 硬性合格
+    for (const s of scoutCfg.recruiterStatus) {
+      if (t.includes(s)) return { ok: true, level: 'hard', status: s };
+    }
+    // 软性合格（需标注）
+    for (const s of scoutCfg.recruiterStatusSoft) {
+      if (t.includes(s)) return { ok: true, level: 'soft', status: s };
+    }
+    return { ok: false, level: 'none', status: '离线/未活跃' };
+  }
+
+  // 评估简历匹配度（关键词命中）
+  function evaluateResumeMatch(text, resumeText) {
+    const t = (text || '').toUpperCase();
+    const resume = (resumeText || '').toUpperCase();
+    // Java 后端线
+    let javaHits = 0;
+    for (const kw of scoutCfg.javaKeywords) {
+      if (t.includes(kw.toUpperCase()) && resume.includes(kw.toUpperCase())) javaHits++;
+    }
+    // AI 应用线
+    let aiHits = 0;
+    for (const kw of scoutCfg.aiKeywords) {
+      if (t.includes(kw.toUpperCase()) && resume.includes(kw.toUpperCase())) aiHits++;
+    }
+    // 判定：任一线命中 4+ 关键词视为贴合
+    const javaOk = javaHits >= 4;
+    const aiOk = aiHits >= 2;  // AI 线关键词少，命中 2 个就算贴合
+    return {
+      pass: javaOk || aiOk,
+      javaHits, aiHits,
+      line: javaOk && aiOk ? 'both' : (javaOk ? 'java' : (aiOk ? 'ai' : 'none'))
+    };
+  }
+
+  // 检查硬伤（命中任一直接跳过）
+  function checkHardInjuries(text) {
+    const t = text || '';
+    const hits = [];
+    for (const inj of scoutCfg.hardInjuries) {
+      if (t.includes(inj)) hits.push(inj);
+    }
+    return { pass: hits.length === 0, hits };
+  }
+
+  // 综合判定一个岗位是否应该收藏
+  // 返回 { pass: bool, reasons: string[], data: {...} }
+  function judgeJobCard(cardText, salary, resumeText) {
+    const reasons = [];
+    const data = {};
+
+    // 1. 时长
+    const months = parseDuration(cardText);
+    data.months = months;
+    if (months < 0) { reasons.push('时长未识别'); }
+    else if (months > scoutCfg.maxMonths) { return { pass: false, reasons: ['时长 ' + months + ' 个月 > ' + scoutCfg.maxMonths], data }; }
+    else { reasons.push('时长 ' + months + ' 月 ✓'); }
+
+    // 2. 日薪
+    const dailySalary = parseDailySalary(salary);
+    data.dailySalary = dailySalary;
+    if (dailySalary < scoutCfg.minDailySalary) { return { pass: false, reasons: ['日薪中值 ' + dailySalary + ' < ' + scoutCfg.minDailySalary], data }; }
+    else { reasons.push('日薪中值 ' + dailySalary + ' ✓'); }
+
+    // 3. 出勤
+    const days = parseDaysPerWeek(cardText);
+    data.daysPerWeek = days;
+    if (days > scoutCfg.maxDaysPerWeek) { return { pass: false, reasons: ['出勤 ' + days + ' 天/周 > ' + scoutCfg.maxDaysPerWeek], data }; }
+    else { reasons.push('出勤 ' + days + ' 天/周 ✓'); }
+
+    // 4. 招聘者状态
+    const recruiter = isRecruiterActive(cardText);
+    data.recruiter = recruiter;
+    if (!recruiter.ok) { reasons.push('招聘者状态未知'); }
+    else { reasons.push('招聘者 ' + recruiter.status + (recruiter.level === 'soft' ? ' (软合格)' : ' ✓')); }
+
+    // 5. 硬伤
+    const hardInj = checkHardInjuries(cardText);
+    data.hardInjuries = hardInj;
+    if (!hardInj.pass) { return { pass: false, reasons: ['硬伤: ' + hardInj.hits.join(',')], data }; }
+    else { reasons.push('无硬伤 ✓'); }
+
+    // 6. 简历匹配（可选，如果提供了简历文本）
+    if (resumeText && resumeText.length > 50) {
+      const match = evaluateResumeMatch(cardText, resumeText);
+      data.match = match;
+      if (!match.pass) { return { pass: false, reasons: ['简历匹配不足 (Java ' + match.javaHits + '/AI ' + match.aiHits + ')'], data }; }
+      else { reasons.push('简历匹配 ' + match.line + ' ✓'); }
+    }
+
+    return { pass: true, reasons, data };
+  }
+
+  // 从详情面板读取招聘者状态
+  function readRecruiterStatusFromDetail(detailPanel) {
+    const allStatuses = ['在线', '刚刚活跃', '今日活跃', '昨日活跃', '3日内活跃', '本周活跃'];
+    
+    // 策略1：尝试定位 HR 信息条（岗位介绍下方、公司信息上方的区域）
+    // BOSS直聘的HR信息通常在特定的容器中
+    const hrInfoSelectors = [
+      '.recruiter-info',
+      '.hr-info', 
+      '.boss-info',
+      '.job-boss',
+      '.recruiter',
+      '.boss-card',
+      '.job-detail .info',
+      '.detail-content .recruiter',
+      '[class*="recruiter"]',
+      '[class*="boss"]'
+    ];
+    
+    for (const selector of hrInfoSelectors) {
+      const hrElement = detailPanel ? detailPanel.querySelector(selector) : document.querySelector(selector);
+      if (hrElement) {
+        const hrText = (hrElement.innerText || '').replace(/\s+/g, ' ').trim();
+        log('[HR状态] 找到HR信息条 (' + selector + '): ' + hrText.substring(0, 200));
+        
+        for (const status of allStatuses) {
+          if (hrText.includes(status)) {
+            log('[HR状态] 从HR信息条匹配到: ' + status);
+            return status;
+          }
+        }
+      }
+    }
+    
+    // 策略2：在整个详情面板中搜索
+    if (detailPanel) {
+      const panelText = (detailPanel.innerText || '').replace(/\s+/g, ' ').trim();
+      log('[HR状态] 详情面板文本片段: ' + panelText.substring(0, 500));
+      
+      for (const status of allStatuses) {
+        if (panelText.includes(status)) {
+          log('[HR状态] 从详情面板匹配到: ' + status);
+          return status;
+        }
+      }
+    }
+    
+    // 策略3：在整个页面中搜索（但要排除列表页的干扰，只搜索右侧详情区域）
+    log('[HR状态] 尝试在页面右侧区域搜索...');
+    const rightPanel = document.querySelector('.job-detail-wrap') || 
+                       document.querySelector('.right-panel') ||
+                       document.querySelector('.side-panel') ||
+                       document.body;
+    const rightText = (rightPanel.innerText || '').replace(/\s+/g, ' ').trim();
+    
+    for (const status of allStatuses) {
+      if (rightText.includes(status)) {
+        log('[HR状态] 从右侧面板匹配到: ' + status);
+        return status;
+      }
+    }
+    
+    // 策略4：搜索包含状态关键词的特定元素（如span、div、badge等）
+    log('[HR状态] 尝试搜索状态标签元素...');
+    const statusElements = $$('span, div, em, i, label').filter((e) => {
+      const t = (e.innerText || '').trim();
+      return allStatuses.some((s) => t === s || t.includes(s));
+    });
+    
+    if (statusElements.length > 0) {
+      // 取第一个匹配的元素，优先取在详情面板内的
+      const inDetail = statusElements.find((e) => detailPanel && detailPanel.contains(e));
+      const target = inDetail || statusElements[0];
+      const statusText = (target.innerText || '').trim();
+      log('[HR状态] 从标签元素匹配到: ' + statusText);
+      return statusText;
+    }
+    
+    log('[HR状态] 未匹配到任何状态');
+    return null;
+  }
+
+  // 在列表页点击岗位卡片打开详情页，然后在右侧详情面板里点击收藏按钮
+  // 返回 { ok, why, recruiterStatus }
+  async function clickFavoriteButton(cardElement) {
+    if (!cardElement) return { ok: false, why: '没有卡片元素', recruiterStatus: null };
+    
+    // 检查是否已暂停/停止
+    if (!scoutProgress.running || scoutProgress.paused) {
+      return { ok: false, why: '筛选已暂停/停止', recruiterStatus: null };
+    }
+    
+    // 1. 找到岗位链接并点击，打开右侧详情面板
+    const jobLink = cardElement.querySelector('a[href*="job_detail"]') || 
+                    cardElement.querySelector('a[href*="job/"]') ||
+                    cardElement.closest('a[href*="job"]');
+    
+    if (!jobLink) {
+      log('[收藏] 未找到岗位链接');
+      return { ok: false, why: '没找到岗位链接', recruiterStatus: null };
+    }
+    
+    log('[收藏] 点击岗位链接打开详情面板');
+    jobLink.click();
+    
+    // 2. 等待详情面板加载（可中断）- 增加等待时间到3秒
+    await sleepInterruptible(3000);
+    if (!scoutProgress.running || scoutProgress.paused) {
+      return { ok: false, why: '筛选已暂停/停止', recruiterStatus: null };
+    }
+    
+    // 3. 在详情面板区域查找收藏按钮
+    // BOSS直聘的详情面板通常在右侧，尝试更多选择器
+    const detailPanel = document.querySelector('.job-detail-wrap') || 
+                       document.querySelector('.job-detail') ||
+                       document.querySelector('.detail-panel') ||
+                       document.querySelector('.job-card-detail') ||
+                       document.querySelector('[class*="detail"]') ||
+                       document.querySelector('.right-panel') ||
+                       document.querySelector('.side-panel');
+    
+    if (!detailPanel) {
+      log('[收藏] 未找到详情面板容器，将在全页面搜索HR状态');
+    } else {
+      log('[收藏] 找到详情面板容器');
+    }
+    
+    // 3.5 读取招聘者状态（如果详情面板没找到，会在全页面搜索）
+    const recruiterStatus = readRecruiterStatusFromDetail(detailPanel);
+    log('[收藏] HR状态: ' + (recruiterStatus || '未知'));
+    
+    // 4. 在详情面板里查找收藏按钮
+    let btns = [];
+    if (detailPanel) {
+      btns = $$('a, button, span, div', detailPanel).filter((e) => {
+        const t = (e.innerText || '').trim();
+        return visible(e) && !isUploadish(e) && (t === '收藏' || t === '感兴趣');
+      });
+    }
+    
+    if (!btns.length) {
+      // 扩大搜索范围：在整个页面查找
+      log('[收藏] 详情面板内未找到收藏按钮，扩大搜索范围');
+      const allBtns = $$('a, button, span, div').filter((e) => {
+        const t = (e.innerText || '').trim();
+        return visible(e) && !isUploadish(e) && (t === '收藏' || t === '感兴趣');
+      });
+      if (!allBtns.length) {
+        log('[收藏] 全页面未找到收藏按钮');
+        return { ok: false, why: '没找到收藏按钮', recruiterStatus };
+      }
+      btns = allBtns;
+    }
+    
+    // 5. 取最里层的元素（避免点到外层容器）
+    const btn = btns.filter((e) => !btns.some((o) => o !== e && e.contains(o)))[0] || btns[0];
+    const label = (btn.innerText || '').trim();
+    
+    log('[收藏] 找到按钮: ' + label);
+    
+    if (label.includes('取消')) {
+      return { ok: false, why: '已经收藏过了（按钮文案是「' + label + '」）', recruiterStatus };
+    }
+    
+    // 6. 点击收藏按钮
+    try {
+      btn.click();
+      await sleepInterruptible(scoutCfg.delayBetweenActions);
+      if (!scoutProgress.running || scoutProgress.paused) {
+        return { ok: false, why: '筛选已暂停/停止', recruiterStatus };
+      }
+      
+      // 7. 校验：按钮文案应该变成"取消收藏"或"已收藏"
+      const newLabel = (btn.innerText || '').trim();
+      log('[收藏] 点击后按钮文案: ' + newLabel);
+      
+      if (newLabel.includes('取消') || newLabel.includes('已')) {
+        return { ok: true, why: '收藏成功', recruiterStatus };
+      }
+      
+      // 再次检查是否有其他反馈
+      await sleepInterruptible(500);
+      if (!scoutProgress.running || scoutProgress.paused) {
+        return { ok: false, why: '筛选已暂停/停止', recruiterStatus };
+      }
+      const finalCheck = detailPanel ? $$('a, button, span, div', detailPanel).some((e) => {
+        const t = (e.innerText || '').trim();
+        return t.includes('取消收藏') || t.includes('已收藏');
+      }) : false;
+      
+      if (finalCheck) {
+        return { ok: true, why: '收藏成功（通过二次检查确认）', recruiterStatus };
+      }
+      
+      return { ok: false, why: '点击后按钮文案未变化（' + newLabel + '），可能没成功', recruiterStatus };
+    } catch (e) {
+      log('[收藏] 点击失败: ' + e.message);
+      return { ok: false, why: '点击失败: ' + e.message, recruiterStatus };
+    }
+  }
+
+  // 筛选主流程：在当前列表页筛选并收藏
+  // 返回 { favorited: [...], skipped: [...], error: string|null }
+  async function runScoutInCurrentPage(startIndex = 0) {
+    const result = { favorited: [], skipped: [], error: null };
+    const resumeText = getResume();
+    const targetCount = scoutCfg.targetCount;
+    const alreadyFavorited = (scoutProgress.favorited || []).slice();
+
+    log('▶ 开始筛选：目标收藏 ' + targetCount + ' 个，已收藏 ' + alreadyFavorited.length + ' 个' + (startIndex > 0 ? '，从第 ' + (startIndex + 1) + ' 个岗位继续' : ''));
+
+    // 检查是否在列表页
+    if (!/\/web\/geek\/job|\/job_list|\/geek\/job/i.test(location.pathname + location.search)) {
+      result.error = '当前不在岗位列表页，请先打开 BOSS 直聘的岗位搜索/列表页';
+      log('✗ ' + result.error);
+      return result;
+    }
+
+    // 如果已达到目标，提示用户但仍允许继续筛选
+    if (alreadyFavorited.length >= targetCount) {
+      log('· 已达到目标收藏数 ' + targetCount + '，将继续筛选更多岗位');
+    }
+
+    // 滚动加载
+    let scrollCount = 0;
+    const maxScrolls = scoutCfg.maxScrollTimes;
+
+    // 持续筛选，直到用户暂停/停止或达到最大滚动次数
+    while (scrollCount <= maxScrolls) {
+      // 抓取当前页所有岗位卡片
+      const links = $$('a').filter((a) => {
+        if (!notMine(a) || !visible(a)) return false;
+        const href = a.href || '';
+        if (!/job_detail|jobDetail|\/job\//.test(href)) return false;
+        const t = (a.innerText || '').trim();
+        return t.length >= 2 && t.length <= 80;
+      });
+
+      if (!links.length) {
+        log('· 本页没有找到岗位卡片');
+        break;
+      }
+
+      log('· 本页识别到 ' + links.length + ' 个岗位卡片');
+
+      // 逐个判定（从 startIndex 开始）
+      for (let i = startIndex; i < links.length; i++) {
+        const a = links[i];
+        // 检查是否被停止或暂停
+        if (!scoutProgress.running) {
+          log('· 筛选已停止');
+          return result;
+        }
+        if (scoutProgress.paused) {
+          // 保存当前位置
+          scoutProgress.currentIndex = i;
+          scoutProgress.currentJobId = jobIdFromHref(a.href);
+          saveScoutProgress();
+          log('· 筛选已暂停，已记录位置：第 ' + (i + 1) + ' 个岗位');
+          updateScoutLiveUI(); // 轻量更新，暂停按钮会由 renderScout() 重建
+          return result;
+        }
+
+        const card = findCard(a);
+        const cardText = (card.innerText || '').replace(/\s+/g, ' ').trim();
+        const jobId = jobIdFromHref(a.href);
+        const title = (a.innerText || a.getAttribute('title') || '').trim();
+
+        // 检查是否已收藏（去重）
+        if (alreadyFavorited.some((j) => j.id === jobId) || result.favorited.some((j) => j.id === jobId)) {
+          // 跳过已收藏的，但仍需更新进度
+          scoutProgress.currentIndex = i;
+          scoutProgress.currentJobId = jobId;
+          continue;
+        }
+
+        // 解析薪资（先解码 PUA 字符，再匹配）
+        const decodedCardText = decodePUASalary(cardText);
+        const domSalaryMatch = decodedCardText.match(SALARY_RE);
+        const domSalary = domSalaryMatch ? domSalaryMatch[0] : '';
+        log('[SalaryAPI] decoded: ' + decodedCardText.substring(0, 200));
+        log('[SalaryAPI] domSalary: "' + domSalary + '"');
+        const salary = getSalaryForJob(jobId, domSalary);
+
+        // 如果使用了 API 缓存数据，记录日志
+        if (salary !== domSalary && salaryCache.has(jobId)) {
+          log('· 使用 API 薪资数据: ' + salary + ' (DOM: ' + domSalary + ')');
+        }
+
+        // 第一阶段：卡片文本初筛（时长、日薪、出勤、硬伤、简历匹配）
+        const verdict = judgeJobCard(cardText, salary, resumeText);
+        if (!verdict.pass) {
+          result.skipped.push({ id: jobId, title, why: verdict.reasons.join('; ') });
+          log('· 跳过: ' + title + ' - ' + verdict.reasons.join('; '));
+          scoutProgress.currentIndex = i;
+          scoutProgress.currentJobId = jobId;
+          updateScoutLiveUI();
+          await sleepInterruptible(scoutCfg.delayBetweenActions);
+          if (!scoutProgress.running || scoutProgress.paused) {
+            log('· 筛选已暂停/停止');
+            return result;
+          }
+          continue;
+        }
+
+        // 第二阶段：打开详情面板，读取 HR 状态并收藏
+        const favResult = await clickFavoriteButton(card);
+        const recruiterStatus = favResult.recruiterStatus;
+
+        // 检查 HR 状态是否符合筛选条件
+        const hrStatuses = scoutCfg.hrActiveStatus || [];
+        if (recruiterStatus && hrStatuses.length > 0 && !hrStatuses.includes(recruiterStatus)) {
+          result.skipped.push({ id: jobId, title, why: 'HR状态不符: ' + (recruiterStatus || '未知') });
+          log('· 跳过 (HR状态不符): ' + title + ' - HR状态: ' + (recruiterStatus || '未知'));
+          scoutProgress.currentIndex = i;
+          scoutProgress.currentJobId = jobId;
+          updateScoutLiveUI();
+          await sleepInterruptible(scoutCfg.delayBetweenActions);
+          if (!scoutProgress.running || scoutProgress.paused) {
+            log('· 筛选已暂停/停止');
+            return result;
+          }
+          continue;
+        }
+
+        if (favResult.ok) {
+          const jobInfo = {
+            id: jobId,
+            title: title,
+            salary: salary,
+            text: cardText.slice(0, 200),
+            verdict: verdict.reasons.join('; '),
+            recruiterStatus: recruiterStatus || '未知',
+            ts: Date.now()
+          };
+          result.favorited.push(jobInfo);
+          scoutProgress.favorited.push(jobInfo);
+          log('✓ 收藏: ' + title + ' | ' + salary + ' | HR:' + (recruiterStatus || '未知') + ' | ' + verdict.reasons.slice(0, 3).join('; '));
+          saveScoutProgress();
+          saveScoutReport();
+
+          // 检查是否已达到目标收藏数
+          if (scoutProgress.favorited.length >= targetCount) {
+            log('▶ 已达到目标收藏数 ' + targetCount + '，停止筛选');
+            scoutProgress.currentIndex = i;
+            scoutProgress.currentJobId = jobId;
+            updateScoutLiveUI();
+            return result;
+          }
+        } else {
+          result.skipped.push({ id: jobId, title, why: '收藏失败: ' + favResult.why });
+          log('· 收藏失败: ' + title + ' - ' + favResult.why);
+        }
+
+        // 保存当前位置
+        scoutProgress.currentIndex = i;
+        scoutProgress.currentJobId = jobId;
+
+        // 轻量级实时更新（不重建按钮，避免事件绑定丢失）
+        updateScoutLiveUI();
+
+        await sleepInterruptible(scoutCfg.delayBetweenActions);
+        if (!scoutProgress.running || scoutProgress.paused) {
+          log('· 筛选已暂停/停止');
+          return result;
+        }
+      }
+
+      // 重置 startIndex，因为翻页/滚动后是新内容
+      startIndex = 0;
+
+      // 尝试翻页或滚动
+      if (scrollCount >= maxScrolls) {
+        log('· 已达到最大滚动次数 ' + maxScrolls + '，停止');
+        break;
+      }
+
+      // 先尝试点"下一页"
+      const nextBtn = findNextButton();
+      if (nextBtn && visible(nextBtn)) {
+        log('· 翻到下一页');
+        nextBtn.click();
+        await sleepInterruptible(3000);  // 等页面加载
+        if (!scoutProgress.running || scoutProgress.paused) {
+          log('· 筛选已暂停/停止');
+          return result;
+        }
+        scrollCount = 0;  // 翻页后重置滚动计数
+        continue;
+      }
+
+      // 没有下一页，尝试滚动加载
+      if (scoutCfg.autoScroll) {
+        log('· 向下滚动加载更多（第 ' + (scrollCount + 1) + ' 次）');
+        try {
+          window.scrollTo(0, document.body.scrollHeight);
+          document.documentElement.scrollTop = document.body.scrollHeight;
+        } catch (e) {}
+        await sleepInterruptible(2500);
+        if (!scoutProgress.running || scoutProgress.paused) {
+          log('· 筛选已暂停/停止');
+          return result;
+        }
+        scrollCount++;
+      } else {
+        break;
+      }
+    }
+
+    log('▶ 筛选结束：本轮收藏 ' + result.favorited.length + ' 个，跳过 ' + result.skipped.length + ' 个');
+    return result;
+  }
+
+  // 批量筛选：按城市列表依次处理
+  async function runScoutAllCities() {
+    scoutProgress.running = true;
+    scoutProgress.paused = false;
+    scoutProgress.favorited = scoutProgress.favorited || [];
+    scoutProgress.skipped = [];
+    saveScoutProgress();
+
+    log('=== 批量筛选启动 ===');
+    log('· 目标城市: ' + scoutCfg.cities.map((c) => c.name).join(', '));
+    log('· 目标收藏总数: ' + scoutCfg.targetCount);
+
+    for (let i = 0; i < scoutCfg.cities.length; i++) {
+      if (!scoutProgress.running) break;
+      if (scoutProgress.favorited.length >= scoutCfg.targetCount) break;
+
+      const city = scoutCfg.cities[i];
+      scoutCfg.currentCity = i;
+      saveScoutCfg();
+
+      log('▶ 开始处理城市: ' + city.name + ' (已收藏 ' + scoutProgress.favorited.length + '/' + scoutCfg.targetCount + ')');
+
+      // 构造该城市的 URL
+      const url = 'https://www.zhipin.com/web/geek/jobs?city=' + city.code + '&jobType=1902&experience=108&degree=203';
+
+      // 打开该城市的列表页（在当前标签页跳转）
+      location.href = url;
+      await sleep(5000);  // 等页面加载
+
+      // 在该页面运行筛选
+      const result = await runScoutInCurrentPage();
+
+      if (result.error) {
+        log('✗ 城市 ' + city.name + ' 出错: ' + result.error);
+      }
+
+      // 如果已达到目标，提前结束
+      if (scoutProgress.favorited.length >= scoutCfg.targetCount) {
+        log('✓ 已达到总目标 ' + scoutCfg.targetCount + '，停止后续城市');
+        break;
+      }
+    }
+
+    scoutProgress.running = false;
+    saveScoutProgress();
+    log('=== 批量筛选结束 ===');
+    log('· 总收藏: ' + scoutProgress.favorited.length);
+    log('· 总跳过: ' + scoutProgress.skipped.length);
+  }
+
+  // 从网页/文档里复制 API Base / Key 时，零宽空格、BOM、方向控制符、换行、制表符等都会一起被带进来。
+  // 它们肉眼看不见，拼进 URL 后地址就不再以 http(s) 开头，xhr 会把它当成站内相对路径 —— POST 打到了
+  // BOSS 自己的 nginx 上，回一个 405 的 HTML 页。所以存之前、用之前都彻底清一遍。
+  // 清理范围：C0 控制字符（\x00-\x1F，含 \n \r \t）、DEL（\x7F）、C1 控制字符（\x80-\x9F）、
+  // Unicode 零宽/格式符（\u200B-\u200F \u202A-\u202E \u2060 \uFEFF）、分隔符（\u2028 \u2029）
+  function cleanCfgStr(v) {
+    return String(v == null ? '' : v)
+      .replace(/[\x00-\x1F\x7F-\x9F]/g, '')
+      .replace(/[\u200B-\u200F\u202A-\u202E\u2060\uFEFF\u2028\u2029]/g, '')
+      .trim();
+  }
+  function cleanApiBase(v) {
+    return cleanCfgStr(v).replace(/\/+$/, '').replace(/\/chat\/completions$/i, '');
+  }
+
   let cfg = load(K.cfg, DEFAULTS);
   cfg = Object.assign({}, DEFAULTS, cfg || {});
+  cfg.apiBase = cleanApiBase(cfg.apiBase) || DEFAULTS.apiBase;
+  cfg.apiKey = cleanCfgStr(cfg.apiKey);
+  cfg.model = cleanCfgStr(cfg.model) || DEFAULTS.model;
   // 迁移：老版本存过 jsdelivr（大陆不通），自动换成 npmmirror
   if (/jsdelivr|unpkg\.com/.test(cfg.pdfWorkerSrc || '')) cfg.pdfWorkerSrc = DEFAULTS.pdfWorkerSrc;
   // 并发生成数：老配置里没这个键时 Object.assign 已经填了默认值；这里再钳进 1..8，
@@ -138,12 +952,13 @@
   if (!Array.isArray(cfg.models) || cfg.models.length === 0) {
     cfg.models = [{ apiBase: String(cfg.apiBase), apiKey: String(cfg.apiKey), model: String(cfg.model) }];
   }
-  // 每个模型对象的字段也做防御性补齐（防止手动编辑存储时漏字段）
+  // 每个模型对象的字段也做防御性补齐（防止手动编辑存储时漏字段），顺手清掉不可见字符
   cfg.models.forEach((m, i) => {
-    m.apiBase = String(m.apiBase || cfg.apiBase);
-    m.apiKey = String(m.apiKey || cfg.apiKey);
-    m.model = String(m.model || cfg.model);
-    m._label = 'm' + (i + 1);   // 内部标签，日志/探针用
+    if (!m || typeof m !== 'object') m = cfg.models[i] = {};
+    m.apiBase = cleanApiBase(m.apiBase) || cleanApiBase(cfg.apiBase);
+    m.apiKey = cleanCfgStr(m.apiKey) || cfg.apiKey;
+    m.model = cleanCfgStr(m.model) || cfg.model;
+    m._label = '并行模型' + (i + 1);   // 内部标签，日志/探针用
   });
 
   function load(key, fallback) {
@@ -164,7 +979,7 @@
     // 不重建 models → generateOne 拿到空 apiKey 直接抛错（ui-smoke 14 条全红）。
     // 补救：如果当前只有一个模型且它的 apiKey 为空，用最新单 Key 字段重建它。
     if (cfg.models.length === 1 && !cfg.models[0].apiKey && cfg.apiKey) {
-      cfg.models = [{ apiBase: String(cfg.apiBase), apiKey: String(cfg.apiKey), model: String(cfg.model), _label: 'm1' }];
+      cfg.models = [{ apiBase: String(cfg.apiBase), apiKey: String(cfg.apiKey), model: String(cfg.model), _label: '并行模型1' }];
       save(K.cfg, cfg);  // 回写更新后的 models
     }
   }
@@ -334,6 +1149,24 @@
   /* ---------------------------------------------------------------- 小工具 */
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  
+  // 可中断的睡眠：每 100ms 检查一次暂停/停止标志
+  const sleepInterruptible = (ms) => new Promise((resolve) => {
+    const start = Date.now();
+    const check = () => {
+      if (!scoutProgress.running || scoutProgress.paused) {
+        resolve();
+        return;
+      }
+      if (Date.now() - start >= ms) {
+        resolve();
+        return;
+      }
+      setTimeout(check, 100);
+    };
+    check();
+  });
+  
   const rnd = (a, b) => Math.floor(a + Math.random() * (b - a));
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   const clamp = (s, n) => { s = String(s || ''); return s.length > n ? s.slice(0, n) : s; };
@@ -774,21 +1607,106 @@
     };
   }
 
+  // 收藏/感兴趣页的主列卡片都在 .job-list-box 里；右侧「谁看过我 / 对我感兴趣的」是独立模块，
+  // 里面的岗位同样是 a[href*=job_detail]，旧版整页扫描会把它们一起抓进来（用户截图里打叉的那几条）。
+  // 先认主列表容器；认不出来时再用「侧栏标题」和「卡片宽度」两道过滤兜底，宁可少抓也不乱抓。
+  const JOB_HREF_RE = /job_detail|jobDetail|\/job\//;
+  const JOB_LIST_SCOPE_SELS = [
+    ['.job-list-box', '[class*="job-list-box"]'],
+    ['[class*="job-list-container"]', '[class*="job-list-wrap"]'],
+    ['[class*="job-list"]']
+  ];
+  const SIDE_HEAD_RE = /^(谁看过我|对我感兴趣的)$/;
+
+  function isJobHref(href) { return JOB_HREF_RE.test(String(href || '')); }
+
+  // 从标题往上找到第一个装着岗位链接的窄容器：右侧两个推荐模块都是这个形状。
+  // 只收窄的（< 55% 视口宽），防止把标题所在的整页大容器误判成侧栏。
+  function sidebarRoots() {
+    const out = [];
+    const heads = $$('h1, h2, h3, h4, h5, strong, span, div, p')
+      .filter((e) => {
+        const t = (e.innerText || '').trim();
+        return t.length >= 4 && t.length <= 12 && SIDE_HEAD_RE.test(t) && visible(e) && notMine(e);
+      });
+    heads.forEach((h) => {
+      let cur = h;
+      for (let i = 0; i < 8 && cur.parentElement; i++) {
+        cur = cur.parentElement;
+        if (!$$('a', cur).some((a) => isJobHref(a.href))) continue;
+        if (cur.getBoundingClientRect().width < window.innerWidth * 0.55 &&
+            !out.some((r) => r === cur || r.contains(cur))) out.push(cur);
+        break;
+      }
+    });
+    return out;
+  }
+
+  // 主列表容器：按精确度分三档找，找到哪一档就只用哪一档的链接。
+  // 宽度 < 45% 视口的不算主列（右侧推荐模块即使 class 里带 job-list 也不会被当成主列表）。
+  function mainListRoots(sideRoots) {
+    for (const sels of JOB_LIST_SCOPE_SELS) {
+      const out = [];
+      sels.forEach((sel) => {
+        $$(sel).forEach((root) => {
+          if (!visible(root)) return;
+          if (root.getBoundingClientRect().width < Math.min(420, window.innerWidth * 0.45)) return;
+          if (sideRoots.some((s) => s.contains(root))) return;
+          if (!$$('a', root).some((a) => isJobHref(a.href) && visible(a) && notMine(a))) return;
+          if (!out.some((r) => r === root || r.contains(root))) out.push(root);
+        });
+      });
+      if (out.length) return out;
+    }
+    return [];
+  }
+
+  function jobLinksIn(roots) {
+    const out = [];
+    roots.forEach((root) => { $$('a', root).forEach((a) => { if (isJobHref(a.href)) out.push(a); }); });
+    return out;
+  }
+
   function scrapeCurrentPage(silent) {
     const seen = {};
     const found = [];
-    $$('a').filter(notMine).forEach((a) => {
-      const href = a.href || '';
-      if (!/job_detail|jobDetail|\/job\//.test(href)) return;
-      const id = jobIdFromHref(href);
-      if (!id || seen[id]) return;
-      // display:none 的模板/广告节点 innerText 会退回 textContent，必须显式判可见
-      if (!visible(a)) return;
+    const side = sidebarRoots();
+    const roots = mainListRoots(side);
+    // 认得出主列表就只扫主列表；认不出才退回整页，但下面会按侧栏标题和卡片宽度再筛。
+    let links = roots.length ? jobLinksIn(roots) : $$('a').filter((a) => isJobHref(a.href));
+    links = links.filter((a) => {
+      if (!notMine(a) || !visible(a)) return false;
+      if (!isJobHref(a.href)) return false;
+      if (side.some((r) => r.contains(a))) return false;
       const t = (a.innerText || '').trim();
-      if (t.length < 2 || t.length > 80) return;
+      return t.length >= 2 && t.length <= 80;
+    });
+    // 没认出主列表容器时的兜底：侧栏卡片窄得多，主列卡片宽。
+    // 以本页最宽卡片的 55% 为界，同时不低于 320px；正常窗口里主列一定过线。
+    let droppedNarrow = 0;
+    if (!roots.length && links.length) {
+      const widths = links.map((a) => {
+        try { return findCard(a).getBoundingClientRect().width; } catch (e) { return 0; }
+      });
+      const maxW = Math.max.apply(null, widths.concat([0]));
+      const minW = Math.max(320, maxW * 0.55);
+      links = links.filter((a, i) => {
+        const keep = widths[i] >= minW;
+        if (!keep) droppedNarrow++;
+        return keep;
+      });
+    }
+    links.forEach((a) => {
+      const id = jobIdFromHref(a.href);
+      if (!id || seen[id]) return;
       seen[id] = 1;
       try { found.push(parseJobCard(a)); } catch (e) { /* 跳过脏节点 */ }
     });
+    if (!silent && (side.length || droppedNarrow)) {
+      log('· 本页只取职位收藏主列表' + (roots.length ? '' : '（没认出主列表容器，按侧栏标题/卡片宽度过滤）') +
+        (droppedNarrow ? '，排除 ' + droppedNarrow + ' 个侧栏窄卡片' : '') +
+        (side.length ? '，已忽略「谁看过我 / 对我感兴趣的」侧栏' : ''));
+    }
     let added = 0;
     // 记下「这张卡片是在哪个列表页看到的」：发送时可以直接在那个列表页上点卡片自己的沟通按钮
     // （见 sendViaListTab），不必再开一次详情页。翻页时 URL 不变，所以同一 URL 下滚动能找到就行。
@@ -1003,10 +1921,15 @@
   async function chat(systemText, userText, modelCfg, attempt) {
     attempt = attempt || 0;
     const mc = modelCfg || cfg;   // 兼容旧调用：不传 modelCfg 时用全局 cfg 兜底
-    if (!mc.apiKey) throw new Error('未填写 API Key');
-    const url = String(mc.apiBase).replace(/\/+$/, '') + '/chat/completions';
+    const apiKey = cleanCfgStr(mc.apiKey);
+    if (!apiKey) throw new Error('未填写 API Key');
+    const apiBase = cleanApiBase(mc.apiBase);
+    if (!/^https?:\/\//i.test(apiBase)) {
+      throw new Error('API Base 填得不对：必须以 http:// 或 https:// 开头（当前是 ' + JSON.stringify(String(mc.apiBase)) + '，可能混进了空格或不可见字符）');
+    }
+    const url = apiBase + '/chat/completions';
     const body = JSON.stringify({
-      model: mc.model,
+      model: cleanCfgStr(mc.model),
       messages: [{ role: 'system', content: systemText }, { role: 'user', content: userText }],
       temperature: Number(cfg.temperature),
       max_tokens: Number(cfg.maxTokens),
@@ -1038,7 +1961,12 @@
     try { data = JSON.parse(res.responseText); } catch (e) { /* 非 JSON */ }
     if (res.status < 200 || res.status >= 300) {
       const hint = data && data.error ? (data.error.message || JSON.stringify(data.error)) : clamp(res.responseText, 200);
-      throw new Error('HTTP ' + res.status + ' ' + hint);
+      // 把最终 POST 的地址写进报错：405/404 这类多半是 Base 拼错（少了 /v1、混进别家域名、
+      // 或者地址粘进了不可见字符），不带上地址的话用户在日志里只能看到一串 nginx 的 HTML。
+      const where = '（POST ' + url + (res.status === 405
+        ? '，405 通常是 API Base 拼错了：确认地址以 /v1 这类版本段结尾，且没有把 /chat/completions 也填进去'
+        : '') + '）';
+      throw new Error('HTTP ' + res.status + ' ' + hint + where);
     }
     const content = data && data.choices && data.choices[0] &&
       ((data.choices[0].message && data.choices[0].message.content) || data.choices[0].text);
@@ -1207,7 +2135,10 @@
   /* -------------------------------------------------------------- 发送消息 */
 
   // 真实沟通页的输入框是 <div class="chat-input" contenteditable="true">（已在本机 Edge 的登录态下看过）。
-  // 先按这个精确特征找，找不到再退回「页面下半部分最大的可输入控件」那套启发式。
+  // 旧版在精确特征找不到时会退回「页面下半部分任何一个 textarea / contenteditable / input[type=text]」，
+  // 结果在收藏列表页上把右侧「VIP 兑换码」那颗 <input> 当成了聊天框，把招呼语填了进去 ——
+  // 用户看到的就是「随便找了个输入框就往里填字」，真正的列表卡片 → 沟通页路线反而没走。
+  // 沟通框只可能是可编辑区域，而且一定长在聊天容器里；凡是普通 <input> 一律不认。
   const CHAT_INPUT_SELS = [
     'div.chat-input[contenteditable="true"]',
     'div.chat-input[contenteditable]',
@@ -1216,23 +2147,41 @@
     '#chat-input[contenteditable]',
     'textarea[class*="chat-input"]'
   ];
+  const CHAT_SCOPE_SELS = [
+    '[class*="chat-conversation"]',
+    '[class*="chat-im"]',
+    '[class*="chat-editor"]',
+    '[class*="editor-container"]',
+    '[class*="message-controls"]',
+    '[class*="chat-content"]'
+  ].join(',');
+
+  function isChatComposer(el) {
+    if (!el || !el.getAttribute) return false;
+    if (!notMine(el) || !visible(el) || isUploadish(el)) return false;
+    const editable = el.tagName === 'TEXTAREA' ||
+      el.isContentEditable ||
+      (el.hasAttribute('contenteditable') && String(el.getAttribute('contenteditable')) !== 'false');
+    if (!editable) return false;
+    if (CHAT_INPUT_SELS.some((sel) => { try { return el.matches(sel); } catch (e) { return false; } })) return true;
+    return !!el.closest(CHAT_SCOPE_SELS);
+  }
 
   function findChatInput() {
     for (const sel of CHAT_INPUT_SELS) {
-      const el = $$(sel).filter((e) => notMine(e) && visible(e) && !isUploadish(e))[0];
+      const el = $$(sel).filter((e) => isChatComposer(e))[0];
       if (el) return el;
     }
-    const cand = $$('textarea, [contenteditable="true"], [contenteditable=""], input[type="text"]')
-      .filter(notMine)
-      .filter(visible)
-      .filter((el) => !isUploadish(el))
+    // 兜底也只在聊天容器里找可编辑区域：input 不认（站点上的搜索框、兑换码框都在这条线外）。
+    const cand = $$('textarea, [contenteditable="true"], [contenteditable=""]')
+      .filter((el) => isChatComposer(el))
       .filter((el) => {
         const ph = (el.placeholder || '') + ' ' + (el.className || '') + ' ' + (el.getAttribute('aria-label') || '');
         return !/搜索|search|手机号|账号|密码|验证/i.test(ph);
       })
       .filter((el) => {
         const r = el.getBoundingClientRect();
-        return r.top > window.innerHeight * 0.3 && r.width > 120;
+        return r.top > window.innerHeight * 0.2 && r.width > 120;
       });
     cand.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
     return cand[0] || null;
@@ -1430,6 +2379,11 @@
   // 往油猴存储写一条持久凭证。面板那一页要是刚好在这之后被跳转销毁，草稿上的「已发送」就没了，
   // 续跑会对着同一个 HR 再发一遍 —— 这条凭证就是用来堵这个口子的。
   async function sendIntoChat(inp, text, jobId) {
+    // 第二道闸：所有调用方都从 findChatInput 拿元素，这里再确认一次它不是搜索框/兑换码框。
+    // 旧版就是因为把收藏列表页右侧的普通 input 当聊天框，招呼语被填进了 VIP 兑换码输入框。
+    if (!isChatComposer(inp)) {
+      return { ok: false, why: '这一页没有真正的聊天输入框，不会往搜索框/兑换码框之类的输入框里填字' };
+    }
     fillInput(inp, text);
     await sleep(rnd(500, 1100));
     let how = (await clickSendButton()) ? 'button' : null;
@@ -1458,6 +2412,14 @@
   async function sendMessage(text, jobId) {
     const inp = findChatInput();
     if (!inp) return { ok: false, noComposer: true, why: '这一页没有聊天输入框（不在沟通页）' };
+    // 站在沟通页上也可能停在上一个 HR 的会话：能认出「不是这条岗位」就绝不填字。
+    // 认不出来的（职位名没渲染）仍然按用户点的那条发，发前日志会提醒核对一眼。
+    const job = jobs.find((x) => x.id === jobId) || {};
+    const vd = chatPageVerdict({ jobId: jobId, title: job.title || '', company: job.company || '', chat: null });
+    if (vd.v === 'no') {
+      return { ok: false, why: '这一页打开的不是这条岗位的沟通会话（' + (vd.why || '职位名对不上') + '），为避免发错人，没有往输入框里填字' };
+    }
+    if (vd.v === 'unknown') log('· 这一页认不出当前会话的职位名，就按你点的「' + jobTitle(jobId) + '」发送，发前可在沟通页核对一眼');
     return await sendIntoChat(inp, text, jobId);
   }
 
@@ -1741,11 +2703,27 @@
     writePlan(targets, true, isExec ? 'exec' : 'page');
     batchTargets = targets.slice();
     startBeat();
-    // 批量前先把缺的 JD 补齐：否则每条都要到 generateOne 那里抛错，一轮跑完全在报「没抓到详情」。
-    // 「抓完列表自动进详情页」关着时不代劳（用户明确要手动控制），下面按条跳过并说清原因。
-    if (cfg.autoFetchDetail) {
-      const need = targets.filter((id) => !hasDetail(id));
-      if (need.length) { log('· 批量前先补 ' + need.length + ' 个岗位的 JD'); await fetchDetails(need); }
+    // 批量前先补齐缺的 JD：有 JD 的先开始生成，没 JD 的后台抓、抓完自动加入生成队列。
+    // 不再阻塞等待全部抓完，避免已就绪的岗位干等。
+    const needDetail = cfg.autoFetchDetail ? targets.filter((id) => !hasDetail(id)) : [];
+    let fetchDone = needDetail.length === 0;   // 没有需要补 JD 的，直接算完成
+    if (needDetail.length) {
+      log('· 批量启动：' + (targets.length - needDetail.length) + ' 个已有 JD 立即生成，' + needDetail.length + ' 个后台补 JD 中');
+      fetchDetails(needDetail).then(() => {
+        refreshDetails();  // 先把内存里的 details 同步过来，否则 hasDetail 判空
+        fetchDone = true;
+        // 详情抓完后，把刚才没 JD 但现在有了的岗位重新分配进各模型队列
+        const nowReady = needDetail.filter((id) => hasDetail(id));
+        if (nowReady.length && runner.running && !stopAll) {
+          log('· ' + nowReady.length + ' 个岗位 JD 已到位，加入生成队列');
+          nowReady.forEach((id) => {
+            const idx = hashId(String(id)) % cfg.models.length;
+            modelBuckets[idx].push(id);
+          });
+        }
+      }).catch(() => { refreshDetails(); fetchDone = true; });
+    } else {
+      log('· 本轮 ' + targets.length + ' 个岗位都有 JD，直接开始生成');
     }
     // ============ v0.5.7：多模型并行 + 组内并发 ============
     // 把 targets 按岗位 id 哈希分配到 cfg.models 的各个模型上，每个模型拿到自己的子队列；
@@ -1764,9 +2742,12 @@
       return Math.abs(h);
     }
     const modelBuckets = cfg.models.map(() => []);
+    // 初始只把有 JD 的岗位放进队列；没 JD 的等 fetchDetails 完成后再补进来
     targets.forEach((id) => {
-      const idx = hashId(String(id)) % cfg.models.length;
-      modelBuckets[idx].push(id);
+      if (hasDetail(id)) {
+        const idx = hashId(String(id)) % cfg.models.length;
+        modelBuckets[idx].push(id);
+      }
     });
     log('· 本轮 ' + targets.length + ' 个岗位，' + cfg.models.length + ' 个模型并行（并发生成 ' + conc + ' 路；发送仍逐条排队，间隔 ' +
       Math.round(cfg.delayMin / 1000) + '~' + Math.round(cfg.delayMax / 1000) + ' 秒）');
@@ -1822,21 +2803,31 @@
     // 浏览器会把隐藏页面的定时器压到一秒一次（隐藏久了压到一分钟一次），轮询式的泵会被压慢；
     // 而大模型的回包是网络回调、不受这套节流影响 —— 所以生成阶段干脆一个定时器都不依赖。
     async function genWorker(queue, modelCfg) {
-      while (queue.length && runner.running && !stopAll) {
+      while (runner.running && !stopAll) {
         if (runner.paused) { await sleep(600); continue; }
-        const id = queue.shift();   // 从共享 queue 里抢一条，抢到就处理，抢不到就退出
-        if (id === undefined) break;
-        await genForBatch(id, modelCfg);
+        if (queue.length) {
+          const id = queue.shift();
+          if (id === undefined) break;
+          await genForBatch(id, modelCfg);
+        } else if (!fetchDone) {
+          // 队列空了但 fetchDetails 还没完，等着新岗位进来
+          await sleep(800);
+        } else {
+          break;   // 队列空且 fetch 也完了，收工
+        }
       }
     }
 
     const producer = (async () => {
       const allWorkers = [];
       modelBuckets.forEach((bucket, i) => {
-        if (!bucket.length) return;
-        const wCount = Math.min(conc, bucket.length);   // 子队列短于并发数时不开多余 worker
+        // 初始队列为空但 fetch 还没完时，也得开一个 worker 等着；否则 fetchDetails 回调里
+        // 把岗位推进 bucket 之后没人消费，整条流水线就卡死了。
+        const wCount = bucket.length
+          ? Math.min(conc, bucket.length)
+          : (!fetchDone ? 1 : 0);
         for (let w = 0; w < wCount; w++) {
-          allWorkers.push(genWorker(bucket, cfg.models[i]));   // 共享同一个 bucket 引用，多个 worker 从同一份列表里抢活
+          allWorkers.push(genWorker(bucket, cfg.models[i]));
         }
       });
       await Promise.all(allWorkers);
@@ -2420,49 +3411,66 @@
   /* ------------------------------------------------------------------ UI */
 
   const STYLE = `
-  #bgPanel{position:fixed;right:18px;top:70px;width:430px;max-height:80vh;z-index:2147483646;
+  #bgPanel{position:fixed;right:18px;top:70px;width:400px;max-height:80vh;z-index:2147483646;
     display:flex;flex-direction:column;background:#fff;border:1px solid #d8dee8;border-radius:10px;
-    box-shadow:0 8px 30px rgba(0,0,0,.16);font:13px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;color:#222}
+    box-shadow:0 8px 30px rgba(0,0,0,.16);font:12.5px/1.45 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;color:#222}
   #bgPanel *{box-sizing:border-box;font-family:inherit}
-  #bgHead{display:flex;align-items:center;gap:8px;padding:9px 12px;background:#1a6fd8;color:#fff;border-radius:10px 10px 0 0;cursor:move}
-  #bgHead b{flex:1;font-size:13px;font-weight:600}
-  #bgTabs{display:flex;gap:2px;padding:6px 8px 0;border-bottom:1px solid #eaeef4;background:#f7f9fc}
-  #bgTabs button{padding:6px 12px;border:0;border-radius:6px 6px 0 0;background:transparent;cursor:pointer;font-size:12.5px;color:#5a6675}
+  #bgHead{display:flex;align-items:center;gap:6px;padding:7px 10px;background:#1a6fd8;color:#fff;border-radius:10px 10px 0 0;cursor:move;flex-wrap:wrap;min-height:34px}
+  #bgHead b{font-size:13px;font-weight:600;white-space:nowrap}
+  #bgHead .stat{font-size:11px;color:#dbe8fb;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
+  #bgTabs{display:flex;gap:1px;padding:5px 8px 0;border-bottom:1px solid #eaeef4;background:#f7f9fc}
+  #bgTabs button{padding:5px 10px;border:0;border-radius:5px 5px 0 0;background:transparent;cursor:pointer;font-size:12px;color:#5a6675}
   #bgTabs button.on{background:#fff;color:#1a6fd8;font-weight:600;box-shadow:0 -1px 0 #1a6fd8 inset}
-  #bgBody{padding:10px 12px;overflow:auto;max-height:calc(80vh - 96px)}
-  #bgBody fieldset{border:1px solid #e6ebf2;border-radius:8px;margin:0 0 10px;padding:8px 10px}
-  #bgBody legend{padding:0 5px;font-size:12px;color:#7a8698}
-  #bgBody label{display:block;margin:5px 0 2px;font-size:12px;color:#5a6675}
-  #bgBody input,#bgBody textarea,#bgBody select{width:100%;padding:6px 8px;border:1px solid #d8dee8;border-radius:6px;font-size:12.5px;background:#fff}
+  #bgBody{padding:8px 10px;overflow:auto;max-height:calc(80vh - 88px)}
+  #bgBody fieldset{border:1px solid #e6ebf2;border-radius:6px;margin:0 0 8px;padding:6px 8px}
+  #bgBody legend{padding:0 4px;font-size:11.5px;color:#7a8698}
+  #bgBody label{display:block;margin:3px 0 1px;font-size:11.5px;color:#5a6675}
+  #bgBody input,#bgBody textarea,#bgBody select{width:100%;padding:5px 7px;border:1px solid #d8dee8;border-radius:5px;font-size:12px;background:#fff}
   #bgBody textarea{resize:vertical}
-  #bgBody .row{display:flex;gap:8px;align-items:center}
+  #bgBody .row{display:flex;gap:6px;align-items:center}
   #bgBody .row>*{flex:1}
-  #bgBody .btns{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
-  #bgBody button.act{padding:6px 11px;border:1px solid #cdd6e2;background:#fff;border-radius:6px;cursor:pointer;font-size:12.5px}
+  #bgBody .btns{display:flex;flex-wrap:wrap;gap:5px;margin:5px 0}
+  #bgBody button.act{padding:5px 10px;border:1px solid #cdd6e2;background:#fff;border-radius:5px;cursor:pointer;font-size:12px}
   #bgBody button.pri{background:#1a6fd8;border-color:#1a6fd8;color:#fff}
   #bgBody button.warn{background:#e8543f;border-color:#e8543f;color:#fff}
-  #bgBody .job{display:flex;gap:7px;padding:7px 6px;border-bottom:1px dashed #eaeef4;align-items:flex-start}
+  #bgBody .job{display:flex;gap:6px;padding:5px 5px;border-bottom:1px dashed #eaeef4;align-items:flex-start}
   #bgBody .job .t{flex:1;min-width:0}
   #bgBody .job .t b{display:block;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  #bgBody .job .t i{display:block;font-style:normal;color:#7a8698;font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  #bgBody .st{font-size:11px;padding:2px 6px;border-radius:9px;background:#eef2f7;color:#5a6675;white-space:nowrap}
+  #bgBody .job .t i{display:block;font-style:normal;color:#7a8698;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #bgBody .st{font-size:10.5px;padding:1px 5px;border-radius:8px;background:#eef2f7;color:#5a6675;white-space:nowrap}
   #bgBody .st.sent{background:#e6f6ec;color:#1c8a45}
   #bgBody .st.err{background:#fdeceb;color:#c8402f}
   #bgBody .st.run{background:#e8f1fd;color:#1a6fd8}
   #bgBody .st.stale{background:#fff4e5;color:#b26a00}
-  #bgBody .draft{background:#f7f9fc;border:1px solid #e6ebf2;border-radius:6px;padding:6px 8px;margin:4px 0 6px;white-space:pre-wrap;font-size:12.5px}
+  #bgBody .draft{background:#f7f9fc;border:1px solid #e6ebf2;border-radius:5px;padding:4px 6px;margin:3px 0 4px;white-space:pre-wrap;font-size:12px}
   #bgBody .draft.stale{opacity:.55;border-style:dashed;border-color:#e8c48a}
-  #bgBody .mini{font-size:11px;color:#93a0b1}
+  #bgBody .mini{font-size:10.5px;color:#93a0b1}
   #bgBody .mini.warn{color:#b26a00}
-  #bgBody .hint{font-size:11.5px;color:#93a0b1;margin:4px 0 8px}
+  #bgBody .hint{font-size:11px;color:#93a0b1;margin:3px 0 6px}
   #bgBody .danger{color:#c8402f}
-  #bgFoot{padding:5px 12px;border-top:1px solid #eaeef4;background:#f7f9fc;color:#5a6675;
-    font-size:11.5px;min-height:22px;border-radius:0 0 10px 10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  #bgMin{position:fixed;right:18px;bottom:80px;z-index:2147483646;padding:8px 12px;border:0;border-radius:20px;
-    background:#1a6fd8;color:#fff;cursor:pointer;box-shadow:0 4px 14px rgba(26,111,216,.4);font-size:12.5px;display:none}
+  #bgFoot{padding:4px 10px;border-top:1px solid #eaeef4;background:#f7f9fc;color:#5a6675;
+    font-size:11px;min-height:20px;border-radius:0 0 10px 10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #bgMin{position:fixed;right:18px;bottom:80px;z-index:2147483646;padding:7px 11px;border:0;border-radius:18px;
+    background:#1a6fd8;color:#fff;cursor:pointer;box-shadow:0 4px 14px rgba(26,111,216,.4);font-size:12px;display:none}
+  /* 模型模式分段控制器 */
+  #bgBody .mode-toggle{display:flex;gap:0;margin:0 0 8px;border:1px solid #d8dee8;border-radius:5px;overflow:hidden}
+  #bgBody .mode-toggle input[type=radio]{display:none}
+  #bgBody .mode-toggle label{flex:1;padding:5px 0;text-align:center;background:#f7f9fc;cursor:pointer;font-size:12px;color:#5a6675;border-right:1px solid #d8dee8;user-select:none}
+  #bgBody .mode-toggle label:last-child{border-right:0}
+  #bgBody .mode-toggle input[type=radio]:checked+label{background:#1a6fd8;color:#fff;font-weight:600}
+  #bgBody .model-panel{display:none}
+  #bgBody .model-panel.on{display:block}
   `;
 
-  let panel, tabs, bodyEl, curTab = 'cfg';
+  let panel, tabs, bodyEl, curTab = 'cfg', modelMode = 'single';
+
+  function toggleMode(m) {
+    modelMode = m;
+    const singleEl = document.getElementById('c_single_panel');
+    const multiEl = document.getElementById('c_multi_panel');
+    if (singleEl) { if (m === 'single') singleEl.classList.add('on'); else singleEl.classList.remove('on'); }
+    if (multiEl) { if (m === 'multi') multiEl.classList.add('on'); else multiEl.classList.remove('on'); }
+  }
 
   function buildPanel() {
     const st = document.createElement('style');
@@ -2472,12 +3480,12 @@
     panel = document.createElement('div');
     panel.id = 'bgPanel';
     panel.innerHTML =
-      '<div id="bgHead"><b>BOSS 打招呼助手</b>' +
-      '<span class="mini" style="color:#9fc0ee;margin-left:6px">v' + VER + '</span>' +
-      '<span id="bgStat" class="mini" style="color:#dbe8fb"></span>' +
-      '<button id="bgClose" style="border:0;background:transparent;color:#fff;cursor:pointer;font-size:16px">×</button></div>' +
+      '<div id="bgHead"><b>BOSS 岗位筛选与打招呼助手</b>' +
+      '<span class="mini" style="color:#9fc0ee;margin-left:4px">v' + VER + '</span>' +
+      '<span id="bgStat" class="stat"></span>' +
+      '<button id="bgClose" style="border:0;background:transparent;color:#fff;cursor:pointer;font-size:16px;margin-left:auto">×</button></div>' +
       '<div id="bgTabs">' +
-      ['cfg|设置', 'resume|简历', 'jobs|岗位', 'queue|队列', 'log|日志'].map((t) => {
+      ['scout|筛选', 'cfg|设置', 'resume|简历', 'jobs|岗位', 'queue|队列', 'log|日志'].map((t) => {
         const p = t.split('|');
         return '<button data-t="' + p[0] + '" class="' + (p[0] === curTab ? 'on' : '') + '">' + p[1] + '</button>';
       }).join('') +
@@ -2491,7 +3499,7 @@
 
     const min = document.createElement('button');
     min.id = 'bgMin';
-    min.textContent = '打招呼助手';
+    min.textContent = '筛选与打招呼助手';
     min.addEventListener('click', () => { panel.style.display = 'flex'; min.style.display = 'none'; });
     document.documentElement.appendChild(min);
 
@@ -2519,7 +3527,8 @@
 
   function render() {
     updateStat();
-    if (curTab === 'cfg') renderCfg();
+    if (curTab === 'scout') renderScout();
+    else if (curTab === 'cfg') renderCfg();
     else if (curTab === 'resume') renderResume();
     else if (curTab === 'jobs') renderJobsTab();
     else if (curTab === 'queue') renderQueue();
@@ -2558,77 +3567,295 @@
   }
   function updateRunnerUI() { updateStat(); }
 
+  /* ---- 筛选页（v0.7.0 新增） ---- */
+  // 轻量级实时更新：只更新进度数字和已收藏列表，不重建按钮/不重绑事件
+  // 用于筛选循环内部，避免 renderScout() 频繁重建 DOM 导致按钮失效
+  function updateScoutLiveUI() {
+    const favorited = scoutProgress.favorited || [];
+    const target = scoutCfg.targetCount;
+
+    // 更新进度数字
+    const progressFieldsets = bodyEl.querySelectorAll('fieldset');
+    if (progressFieldsets[1]) {
+      const miniDiv = progressFieldsets[1].querySelector('.mini');
+      if (miniDiv) miniDiv.innerHTML = '已收藏: <b>' + favorited.length + '</b> / ' + target;
+    }
+
+    // 更新已收藏列表
+    const listEl = bodyEl.querySelector('#s_list');
+    if (listEl) {
+      // 同时更新 legend 中的计数
+      const listFieldset = listEl.closest('fieldset');
+      if (listFieldset) {
+        const legend = listFieldset.querySelector('legend');
+        if (legend) legend.textContent = '已收藏岗位 (' + favorited.length + ')';
+      }
+      if (favorited.length === 0) {
+        listEl.innerHTML = '<div class="mini">暂无</div>';
+      } else {
+        listEl.innerHTML = favorited.slice().reverse().map((j) =>
+          '<div class="job"><div class="t"><b>' + esc(j.title || '(无标题)') + '</b>' +
+          '<i>' + esc(j.salary || '') + ' · HR:' + esc(j.recruiterStatus || '未知') + ' · ' + esc((j.verdict || '').slice(0, 60)) + '</i>' +
+          '<i class="mini">' + esc(new Date(j.ts).toLocaleString()) + '</i></div></div>'
+        ).join('');
+      }
+    }
+  }
+
+  function renderScout() {
+    const isRunning = scoutProgress.running;
+    const isPaused = scoutProgress.paused;
+    const favorited = scoutProgress.favorited || [];
+    const target = scoutCfg.targetCount;
+
+    bodyEl.innerHTML =
+      '<fieldset><legend>岗位筛选与收藏（第一部分）</legend>' +
+      '<div class="hint">在 BOSS 直聘实习列表页自动筛选并收藏符合要求的岗位。筛选口径：时长≤' + scoutCfg.maxMonths + '月、日薪中值≥' + scoutCfg.minDailySalary + '、出勤≤' + scoutCfg.maxDaysPerWeek + '天/周、招聘者活跃、简历匹配、无硬伤。</div>' +
+
+      // 目标城市配置
+      '<label>目标城市（每行一个：城市名,城市代码）</label>' +
+      '<textarea id="s_cities" rows="4" placeholder="北京,101010100&#10;上海,101020100">' + esc(scoutCfg.cities.map((c) => c.name + ',' + c.code).join('\n')) + '</textarea>' +
+
+      // 筛选参数
+      '<div class="row">' +
+      '<div><label>目标收藏数</label><input id="s_target" type="number" value="' + esc(target) + '"></div>' +
+      '<div><label>最长实习(月)</label><input id="s_months" type="number" value="' + esc(scoutCfg.maxMonths) + '"></div>' +
+      '<div><label>最低日薪(中值)</label><input id="s_salary" type="number" value="' + esc(scoutCfg.minDailySalary) + '"></div>' +
+      '</div>' +
+      '<div class="row">' +
+      '<div><label>最多出勤(天/周)</label><input id="s_days" type="number" value="' + esc(scoutCfg.maxDaysPerWeek) + '"></div>' +
+      '<div><label>最大滚动次数</label><input id="s_scroll" type="number" value="' + esc(scoutCfg.maxScrollTimes) + '"></div>' +
+      '<div><label>操作间隔(ms)</label><input id="s_delay" type="number" value="' + esc(scoutCfg.delayBetweenActions) + '"></div>' +
+      '</div>' +
+
+      // HR 活跃度筛选
+      '<label>HR 活跃度筛选（勾选的状态才通过）</label>' +
+      '<div class="row" style="flex-wrap:wrap;gap:8px">' +
+      ['在线', '刚刚活跃', '今日活跃', '昨日活跃', '3日内活跃', '本周活跃'].map((s) =>
+        '<label style="display:inline-flex;align-items:center;gap:4px;font-size:12px"><input type="checkbox" class="s_hr_status" value="' + s + '"' +
+        ((scoutCfg.hrActiveStatus || []).includes(s) ? ' checked' : '') + '> ' + s + '</label>'
+      ).join('') +
+      '</div>' +
+
+      // 控制按钮
+      '<div class="btns">' +
+      '<button class="act pri" id="s_save"' + (isRunning ? ' disabled' : '') + '>保存配置</button>' +
+      '<button class="act pri" id="s_start"' + (isRunning ? ' disabled' : '') + '>开始筛选当前页</button>' +
+      '<button class="act" id="s_startall"' + (isRunning ? ' disabled' : '') + '>批量筛选所有城市</button>' +
+      (isRunning ? '<button class="act" id="s_pause_resume">' + (scoutProgress.paused ? '继续' : '暂停') + '</button>' : '') +
+      (isRunning ? '<button class="act" id="s_stop">停止</button>' : '') +
+      '</div>' +
+      '</fieldset>' +
+
+      // 进度显示
+      '<fieldset><legend>筛选进度</legend>' +
+      '<div class="row">' +
+      '<div class="mini">已收藏: <b>' + favorited.length + '</b> / ' + target + '</div>' +
+      '<div class="mini">状态: ' + (isRunning ? (isPaused ? '<span style="color:#b26a00">已暂停</span>' : '<span style="color:#1c8a45">运行中</span>') : '<span>空闲</span>') + '</div>' +
+      '</div>' +
+      '<div class="btns">' +
+      '<button class="act" id="s_clear">清空进度</button>' +
+      '<button class="act" id="s_export">导出报告</button>' +
+      '</div>' +
+      '</fieldset>' +
+
+      // 已收藏列表
+      '<fieldset><legend>已收藏岗位 (' + favorited.length + ')</legend>' +
+      '<div id="s_list" style="max-height:200px;overflow:auto">' +
+      (favorited.length === 0 ? '<div class="mini">暂无</div>' :
+        favorited.slice().reverse().map((j) =>
+          '<div class="job"><div class="t"><b>' + esc(j.title || '(无标题)') + '</b>' +
+          '<i>' + esc(j.salary || '') + ' · HR:' + esc(j.recruiterStatus || '未知') + ' · ' + esc((j.verdict || '').slice(0, 60)) + '</i>' +
+          '<i class="mini">' + esc(new Date(j.ts).toLocaleString()) + '</i></div></div>'
+        ).join('')) +
+      '</div>' +
+      '</fieldset>';
+
+    // 绑定事件
+    $('#s_save', bodyEl)?.addEventListener('click', () => {
+      // 解析城市
+      const lines = ($('#s_cities', bodyEl).value || '').split('\n').map((l) => l.trim()).filter(Boolean);
+      const cities = lines.map((l) => {
+        const parts = l.split(',');
+        return { name: (parts[0] || '').trim(), code: (parts[1] || '').trim() };
+      }).filter((c) => c.name && c.code);
+      scoutCfg.cities = cities.length ? cities : SCOUT_DEFAULTS.cities;
+      scoutCfg.targetCount = Math.max(1, Number($('#s_target', bodyEl).value) || 20);
+      scoutCfg.maxMonths = Math.max(1, Number($('#s_months', bodyEl).value) || 3);
+      scoutCfg.minDailySalary = Math.max(0, Number($('#s_salary', bodyEl).value) || 200);
+      scoutCfg.maxDaysPerWeek = Math.max(1, Number($('#s_days', bodyEl).value) || 5);
+      scoutCfg.maxScrollTimes = Math.max(1, Number($('#s_scroll', bodyEl).value) || 10);
+      scoutCfg.delayBetweenActions = Math.max(500, Number($('#s_delay', bodyEl).value) || 1500);
+      // 保存 HR 活跃度筛选
+      const hrStatusCheckboxes = $$('.s_hr_status', bodyEl);
+      scoutCfg.hrActiveStatus = hrStatusCheckboxes.filter((cb) => cb.checked).map((cb) => cb.value);
+      saveScoutCfg();
+      log('✓ 筛选配置已保存');
+      renderScout();
+    });
+
+    $('#s_start', bodyEl)?.addEventListener('click', async () => {
+      if (scoutProgress.running) { log('· 筛选已在运行'); return; }
+      scoutProgress.running = true;
+      scoutProgress.paused = false;
+      scoutProgress.currentIndex = 0;
+      scoutProgress.currentJobId = '';
+      saveScoutProgress();
+      renderScout(); // 立即显示暂停/停止按钮
+      log('▶ 开始筛选当前页...');
+      const result = await runScoutInCurrentPage(0);
+      // 筛选完成或停止时重置状态
+      if (!scoutProgress.paused) {
+        scoutProgress.running = false;
+        scoutProgress.paused = false;
+        scoutProgress.currentIndex = 0;
+        scoutProgress.currentJobId = '';
+      }
+      saveScoutProgress();
+      if (result.error) log('✗ 错误: ' + result.error);
+      else log('▶ 筛选结束：本轮收藏 ' + result.favorited.length + ' 个，跳过 ' + result.skipped.length + ' 个');
+      renderScout();
+    });
+
+    $('#s_startall', bodyEl)?.addEventListener('click', async () => {
+      if (scoutProgress.running) { log('· 筛选已在运行'); return; }
+      if (!confirm('将按配置依次处理 ' + scoutCfg.cities.length + ' 个城市，目标收藏 ' + scoutCfg.targetCount + ' 个。期间会跳转页面，确定开始？')) return;
+      scoutProgress.running = true;
+      scoutProgress.paused = false;
+      scoutProgress.currentIndex = 0;
+      scoutProgress.currentJobId = '';
+      saveScoutProgress();
+      renderScout(); // 立即显示暂停/停止按钮
+      log('▶ 开始批量筛选所有城市...');
+      await runScoutAllCities();
+      scoutProgress.running = false;
+      scoutProgress.paused = false;
+      scoutProgress.currentIndex = 0;
+      scoutProgress.currentJobId = '';
+      saveScoutProgress();
+      renderScout();
+    });
+
+    // 暂停/继续按钮：切换显示，暂停时保存位置，继续时从标记处恢复
+    $('#s_pause_resume', bodyEl)?.addEventListener('click', async () => {
+      if (scoutProgress.paused) {
+        // 继续：从上次位置继续
+        scoutProgress.paused = false;
+        saveScoutProgress();
+        renderScout(); // 立即切换按钮文字为"暂停"
+        const resumeIndex = scoutProgress.currentIndex || 0;
+        log('▶ 继续筛选，从第 ' + (resumeIndex + 1) + ' 个岗位开始...');
+        const result = await runScoutInCurrentPage(resumeIndex);
+        // 筛选完成或停止时重置状态
+        if (!scoutProgress.paused) {
+          scoutProgress.running = false;
+          scoutProgress.paused = false;
+          scoutProgress.currentIndex = 0;
+          scoutProgress.currentJobId = '';
+        }
+        saveScoutProgress();
+        if (result.error) log('✗ 错误: ' + result.error);
+        else log('▶ 筛选结束：本轮收藏 ' + result.favorited.length + ' 个，跳过 ' + result.skipped.length + ' 个');
+        renderScout();
+      } else {
+        // 暂停：保存位置，按钮变"继续"
+        scoutProgress.paused = true;
+        saveScoutProgress();
+        log('· 筛选已暂停，已记录位置：第 ' + (scoutProgress.currentIndex + 1) + ' 个岗位');
+        renderScout();
+      }
+    });
+
+    // 停止按钮：直接结束筛选，按钮消失，无后续操作
+    $('#s_stop', bodyEl)?.addEventListener('click', () => {
+      scoutProgress.running = false;
+      scoutProgress.paused = false;
+      scoutProgress.currentIndex = 0;
+      scoutProgress.currentJobId = '';
+      saveScoutProgress();
+      log('· 筛选已停止');
+      renderScout();
+    });
+
+    $('#s_clear', bodyEl)?.addEventListener('click', () => {
+      if (!confirm('确定清空所有筛选进度和报告？')) return;
+      scoutProgress = { favorited: [], skipped: [], running: false, paused: false, currentIndex: 0, currentJobId: '' };
+      scoutReport = [];
+      saveScoutProgress();
+      saveScoutReport();
+      log('· 筛选进度已清空');
+      renderScout();
+    });
+
+    $('#s_export', bodyEl)?.addEventListener('click', () => {
+      const report = {
+        exported: new Date().toISOString(),
+        config: scoutCfg,
+        progress: scoutProgress,
+        report: scoutReport
+      };
+      const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'boss-scout-report-' + new Date().toISOString().slice(0, 10) + '.json';
+      a.click();
+      URL.revokeObjectURL(url);
+      log('· 报告已导出');
+    });
+  }
+
   /* ---- 设置页 ---- */
   function renderCfg() {
     bodyEl.innerHTML =
+      // 顶部：模式选择器（2选1）
+      '<div class="mode-toggle">' +
+      '<input type="radio" name="model_mode" id="mm_single" value="single" ' + (modelMode !== 'multi' ? 'checked' : '') + '>' +
+      '<label for="mm_single">单模型</label>' +
+      '<input type="radio" name="model_mode" id="mm_multi" value="multi" ' + (modelMode === 'multi' ? 'checked' : '') + '>' +
+      '<label for="mm_multi">多模型并行</label>' +
+      '</div>' +
+
+      // 单模型面板：完整 API 配置
+      '<div id="c_single_panel" class="model-panel' + (modelMode !== 'multi' ? ' on' : '') + '">' +
       '<fieldset><legend>大模型接口（OpenAI 兼容）</legend>' +
       '<label>API Base</label><input id="c_base" value="' + esc(cfg.apiBase) + '" placeholder="https://api.xxx.com/v1">' +
-      '<label>API Key（仅存本机油猴存储，不会写进日志）</label>' +
+      '<label>API Key（仅存本机，不会写进日志）</label>' +
       '<div class="row"><input id="c_key" type="password" value="' + esc(cfg.apiKey) + '" placeholder="sk-...">' +
-      '<button class="act" id="c_eye" style="flex:0 0 60px">显示</button></div>' +
+      '<button class="act" id="c_eye" style="flex:0 0 56px">显示</button></div>' +
       '<label>Model</label><input id="c_model" value="' + esc(cfg.model) + '">' +
       '<div class="row"><div><label>temperature</label><input id="c_temp" value="' + esc(cfg.temperature) + '"></div>' +
       '<div><label>max_tokens</label><input id="c_mt" value="' + esc(cfg.maxTokens) + '"></div>' +
-      '<div><label>并发生成数(1-8)</label><input id="c_conc" value="' + esc(cfg.genConcurrency) + '"></div></div>' +
-      '<div class="hint">并发生成数 = 同时挂出去的大模型请求条数。批量时靠它提速：20 条岗位按 3 路并发，' +
-      '生成阶段的等待大约缩到三分之一，同一把 Key 省的是<b>时间</b>不是钱（每条照样各算一次 token）。' +
-      '<b>只有生成会并发，发送仍然逐条排队、照旧等间隔</b> —— 站点那边看到的节奏一点没变，' +
-      '而且跨标签回执只有一个存储槽位，两条并发发送会互相冲掉、谁都没法确认自己那条发没发出去。' +
-      '服务商报 429/限流（日志会出现「模型限流/异常 429」）就把它调回 1。</div>' +
+      '<div><label>并发数(1-8)</label><input id="c_conc" value="' + esc(cfg.genConcurrency) + '"></div></div>' +
+      '<div class="hint">并发只加速生成，发送仍逐条排队。遇 429 限流就调回 1。</div>' +
       '<div class="btns"><button class="act pri" id="c_save">保存设置</button><button class="act" id="c_test">连通测试</button></div>' +
-      '<div class="hint">Key 泄露风险：不要把这个脚本上传到公开仓库；换电脑前手动备份。</div>' +
-
-      // v0.5.8：多模型配置折叠面板
-      '<details id="c_multi_models" style="margin-top:8px;padding:8px;border:1px solid #ddd;border-radius:4px">' +
-      '<summary style="cursor:pointer;font-weight:bold">多模型并行（点击展开）</summary>' +
-      '<div class="hint" style="margin-top:8px">批量时把岗位按哈希分配到不同模型，各跑各的互不干扰。留空则用上面那组单 Key 配置。</div>' +
-      '<div id="c_models_list" style="margin-top:8px"></div>' +
-      '<button class="act" id="c_add_model" style="margin-top:8px">+ 添加模型</button>' +
-      '<div class="btns" style="margin-top:8px"><button class="act pri" id="c_save_models">保存多模型配置</button></div>' +
-      '</details>' +
-
+      '<div class="hint">Key 不要上传公开仓库；换电脑前手动备份。</div>' +
       '</fieldset>' +
+      '</div>' +
+
+      // 多模型面板：多模型列表配置
+      '<div id="c_multi_panel" class="model-panel' + (modelMode === 'multi' ? ' on' : '') + '">' +
+      '<fieldset><legend>多模型并行配置</legend>' +
+      '<div class="hint">批量时岗位按哈希分配到不同模型，各跑各的互不干扰。</div>' +
+      '<div id="c_models_list" style="margin-top:4px"></div>' +
+      '<div class="btns" style="margin-top:4px"><button class="act" id="c_add_model">+ 添加模型</button><button class="act pri" id="c_save_models">保存多模型配置</button></div>' +
+      '</fieldset>' +
+      '</div>' +
 
       '<fieldset><legend>发送策略</legend>' +
-      '<label class="mini"><input type="radio" name="mode" id="m_semi" ' + (!cfg.autoSend ? 'checked' : '') + ' style="width:auto"> 半自动：脚本只生成，我点「发送」</label>' +
-      '<label class="mini"><input type="radio" name="mode" id="m_auto" ' + (cfg.autoSend ? 'checked' : '') + ' style="width:auto"> 全自动：生成后自动开沟通页发送</label>' +
-      '<div class="hint danger">全自动批量打招呼违反 BOSS 直聘用户协议，有限流/封号风险；先小量验证，别一上来就跑几十条。</div>' +
+      '<div class="row" style="margin-bottom:4px"><label class="mini" style="margin:0"><input type="radio" name="mode" id="m_semi" ' + (!cfg.autoSend ? 'checked' : '') + ' style="width:auto"> 半自动：只生成，我点发送</label>' +
+      '<label class="mini" style="margin:0"><input type="radio" name="mode" id="m_auto" ' + (cfg.autoSend ? 'checked' : '') + ' style="width:auto"> 全自动：生成后自动发送</label></div>' +
+      '<div class="hint danger">全自动有封号风险，先小量验证。</div>' +
       '<div class="row"><div><label>最小间隔(ms)</label><input id="c_dmin" value="' + esc(cfg.delayMin) + '"></div>' +
       '<div><label>最大间隔(ms)</label><input id="c_dmax" value="' + esc(cfg.delayMax) + '"></div>' +
       '<div><label>每日上限</label><input id="c_max" value="' + esc(cfg.maxPerDay) + '"></div></div>' +
-      '<label class="mini"><input type="checkbox" id="c_open" ' + (cfg.autoOpenChat ? 'checked' : '') + ' style="width:auto"> 自动点击「立即沟通」（岗位详情页那条入口必开：全自动不勾它，后台开出来的详情页永远等不到输入框；开着下面「优先在列表页卡片上点」时不看它）</label>' +
-      '<label class="mini"><input type="checkbox" id="c_listsend" ' + (cfg.sendViaList ? 'checked' : '') + ' style="width:auto"> 优先在列表页卡片上点「继续沟通/立即沟通」（少开一次详情页，一步到沟通页）</label>' +
-      '<div class="hint">勾上后发送走这条路：另开一个列表页标签 → 用卡片自己的链接认出这张卡片 → 点它右上角那颗沟通按钮 → 到沟通页填好发出去；' +
-      '列表页里找不到这张卡片（在后面几页里、已取消收藏）或卡片上没有沟通按钮时，自动退回「开岗位详情页再点」那条老路。' +
-      '<b>脚本只在这类它自己开出来的标签页里点按钮，绝不在你正在看的那一页点</b> —— 收藏列表每张卡片都有一颗，点错卡片就把 A 岗位的话发给了 B 的 HR。</div>' +
-      '<div class="hint">全自动的一条发送会自己开一个标签页：岗位页 → 点沟通入口 → 跳到沟通页 → 填 → 点发送。' +
-      '跳转后的那一页先确认「当前会话就是这条岗位」：比对浏览器导航记录里那一跳的 jobId（沟通页会把地址栏洗掉，' +
-      '但导航记录里还在）和页面右侧的职位名。对不上就停手不发送；实在拿不到可比对的东西就只填不发，' +
-      '留给你确认，避免把话发给错的 HR。</div>' +
-      '<label class="mini"><input type="checkbox" id="c_adet" ' + (cfg.autoFetchDetail ? 'checked' : '') + ' style="width:auto"> 勾选岗位就自动抓详情（v0.5.1：抓完列表不再默认全塞进队列，勾上才算要处理；勾上的岗位若缺 JD，后台标签逐个打开岗位链接抓回来，用完自动关。连点几颗勾选框会攒成一批一起开，不会一条一个标签）。关掉它不会让脚本改用卡片那一行凑合 —— 没 JD 的岗位就是不生成，得先点队列里的「补抓详情并生成」或「抓选中岗位详情」</label>' +
-      '<label class="mini"><input type="checkbox" id="c_close" ' + (cfg.autoCloseDetail ? 'checked' : '') + ' style="width:auto"> 后台标签用完自动关闭（只关发成功的那个；失败的留着给你看）</label>' +
-      '<label class="mini"><input type="checkbox" id="c_resume" ' + (cfg.autoResume ? 'checked' : '') + ' style="width:auto"> 页面跳转后自动接着跑上一轮批量</label>' +
-      '<div class="hint">勾上这一项后，跑着的那一页没了（被关掉、被浏览器回收、或者你关掉的就是生成器标签页），' +
-      '别的页面十几秒内会认出一份没跑完的计划并<b>再开一个生成器</b>接着跑剩下的岗位。' +
-      '<b>已经发出去的不会被重发</b>：真发出去的那一瞬间由发的那一页留一条持久凭证，续跑时先认它，补记成「已发送」。' +
-      '不想让它自己接着跑就关掉这里 —— 队列页仍然会有「继续上次批量（剩 N 条）」，由你点。' +
-      '跑批量时切换面板里的标签、最小化面板都不会打断（只有整页跳转才会）。</div>' +
-      '<label class="mini"><input type="checkbox" id="c_exec" ' + (cfg.bgExecutor ? 'checked' : '') + ' style="width:auto"> 批量交给后台「生成器」标签页跑（切页面不打断生成，也不再弹「是否离开网站？」）</label>' +
-      '<div class="hint">勾选后点「开始批量」会多出一个标签页（标题写着「招呼语生成器 · 请别关这个标签页」），循环活在那一页里：' +
-      '生成招呼语只要读油猴存储里的简历、JD、提示词，再朝<b>你自己的</b>模型服务发一次请求，不需要你正在看的那一页 —— 所以它不该长在你随时会跳走的页面上。' +
-      '跑完（或这一轮没有可跑的了）它自己关闭；提前关掉它也不丢已经生成的草稿，十几秒内会再开一个接着跑剩下的。' +
-      '<br>代价按实说：① 浏览器对看不见的标签页会压定时器（隐藏页最快一秒一次，Edge 的「睡眠标签页」还可能直接回收它），' +
-      '<b>生成靠大模型回包驱动、不看定时器，所以照跑</b>；受影响的只是全自动里每条之间那 ' +
-      Math.round(cfg.delayMin / 1000) + '~' + Math.round(cfg.delayMax / 1000) + ' 秒发送间隔和等回执的轮询，可能被压到最长约一分钟一条 —— 介意就把这一页切到前台，它会快回来。' +
-      '② 多一个标签页要占地方，别让浏览器插件把它当幽灵标签清掉。' +
-      '③ 交接最多等 25 秒，那一页起不来（比如站点弹了登录/验证码）就自动退回「跑在你正看着的这一页」，此时才会重新弹「是否离开网站？」。</div>' +
       '<div class="btns"><button class="act" id="c_save2">保存策略</button></div>' +
       '</fieldset>' +
 
-      '<fieldset><legend>提示词（{{RESUME}} / {{JOB}} 会自动替换）</legend>' +
+      '<fieldset><legend>提示词（{{RESUME}} / {{JOB}} 自动替换）</legend>' +
       '<label>System</label><textarea id="c_sys" rows="8">' + esc(cfg.systemPrompt) + '</textarea>' +
       '<label>User</label><textarea id="c_usr" rows="6">' + esc(cfg.userPrompt) + '</textarea>' +
-      '<div class="btns"><button class="act" id="c_save3">保存提示词</button><button class="act" id="c_reset">恢复默认提示词</button></div>' +
+      '<div class="btns"><button class="act" id="c_save3">保存提示词</button><button class="act" id="c_reset">恢复默认</button></div>' +
       '</fieldset>';
 
     const g = (id) => $('#' + id, bodyEl);
@@ -2636,10 +3863,12 @@
       const i = g('c_key'); const show = i.type === 'password';
       i.type = show ? 'text' : 'password'; $('#c_eye', bodyEl).textContent = show ? '隐藏' : '显示';
     });
+    // 模式切换（radio 2选1）
+    $$('input[name=model_mode]', bodyEl).forEach((r) => r.addEventListener('change', () => toggleMode(r.value)));
     const collect = () => {
-      cfg.apiBase = g('c_base').value.trim() || DEFAULTS.apiBase;
-      cfg.apiKey = g('c_key').value.trim();
-      cfg.model = g('c_model').value.trim();
+      cfg.apiBase = cleanApiBase(g('c_base').value) || DEFAULTS.apiBase;
+      cfg.apiKey = cleanCfgStr(g('c_key').value);
+      cfg.model = cleanCfgStr(g('c_model').value);
       cfg.temperature = Number(g('c_temp').value) || 0.8;
       cfg.maxTokens = Number(g('c_mt').value) || 400;
       cfg.genConcurrency = Math.min(8, Math.max(1, Math.round(Number(g('c_conc').value) || 3)));
@@ -2651,14 +3880,6 @@
       cfg.delayMin = Math.max(2000, Number(g('c_dmin').value) || 9000);
       cfg.delayMax = Math.max(cfg.delayMin, Number(g('c_dmax').value) || 22000);
       cfg.maxPerDay = Math.max(1, Number(g('c_max').value) || 20);
-      cfg.autoOpenChat = $('#c_open', bodyEl).checked;
-      cfg.sendViaList = $('#c_listsend', bodyEl).checked;
-      cfg.autoCloseDetail = $('#c_close', bodyEl).checked;
-      cfg.autoFetchDetail = $('#c_adet', bodyEl).checked;
-      cfg.autoResume = $('#c_resume', bodyEl).checked;
-      cfg.bgExecutor = $('#c_exec', bodyEl).checked;
-      // 全自动开出来的就是岗位详情页，不点「立即沟通」永远等不到输入框。
-      // 与其让用户自己发现每条都失败，不如保存时直接把这项打开并说明原因。
       if (cfg.autoSend && !cfg.autoOpenChat) {
         cfg.autoOpenChat = true;
         log('· 已同时打开「自动点击立即沟通」：全自动必须靠它打开沟通页，否则每条都会失败');
@@ -2685,19 +3906,18 @@
       }
     });
 
-    // v0.5.7：多模型配置 UI（卡片式，和上面单模型风格一致）
     function renderModelsList() {
       const listEl = $('#c_models_list', bodyEl);
       if (!listEl) return;
       const models = cfg.models || [];
       if (models.length === 0) {
-        listEl.innerHTML = '<div class="hint">暂无多模型配置，点击「+ 添加模型」开始</div>';
+        listEl.innerHTML = '<div class="hint">暂无配置，点「+ 添加模型」开始</div>';
         return;
       }
       let html = '';
       models.forEach((m, i) => {
-        html += '<fieldset style="margin-bottom:8px;padding:8px;border:1px solid #ddd;border-radius:4px">' +
-          '<legend style="font-weight:bold;padding:0 4px">' + (m._label || ('m' + (i + 1))) + ' <button class="del-btn" data-i="' + i + '" style="padding:2px 8px;font-size:12px;background:#f44;color:#fff;border:none;border-radius:3px;cursor:pointer;margin-left:8px">删除</button></legend>' +
+        html += '<fieldset style="margin-bottom:6px;padding:6px 8px;border:1px solid #ddd;border-radius:4px">' +
+          '<legend style="font-weight:bold;padding:0 4px;font-size:11.5px">并行模型' + (i + 1) + ' <button class="del-btn" data-i="' + i + '" style="padding:1px 7px;font-size:11px;background:#f44;color:#fff;border:none;border-radius:3px;cursor:pointer;margin-left:6px">删除</button></legend>' +
           '<label>API Base</label><input class="m_base" value="' + esc(m.apiBase) + '" placeholder="https://api.xxx.com/v1">' +
           '<label>API Key</label><input class="m_key" type="password" value="' + esc(m.apiKey) + '" placeholder="sk-...">' +
           '<label>Model</label><input class="m_model" value="' + esc(m.model) + '" placeholder="qwen-max">' +
@@ -2706,7 +3926,6 @@
       listEl.innerHTML = html;
     }
 
-    // 事件委托：删除按钮
     $('#c_models_list', bodyEl).addEventListener('click', (e) => {
       if (e.target.classList.contains('del-btn')) {
         const idx = parseInt(e.target.dataset.i);
@@ -2717,19 +3936,18 @@
     });
 
     $('#c_add_model', bodyEl).addEventListener('click', () => {
-      cfg.models.push({ apiBase: cfg.apiBase || DEFAULTS.apiBase, apiKey: '', model: '', _label: 'm' + (cfg.models.length + 1) });
+      cfg.models.push({ apiBase: cfg.apiBase || DEFAULTS.apiBase, apiKey: '', model: '', _label: '并行模型' + (cfg.models.length + 1) });
       renderModelsList();
     });
 
     $('#c_save_models', bodyEl).addEventListener('click', () => {
       const fieldsets = Array.from(document.querySelectorAll('#c_models_list fieldset'));
       cfg.models = fieldsets.map((fs, i) => {
-        const base = fs.querySelector('.m_base').value.trim();
-        const key = fs.querySelector('.m_key').value.trim();
-        const model = fs.querySelector('.m_model').value.trim();
-        return { apiBase: base, apiKey: key, model: model, _label: 'm' + (i + 1) };
-      }).filter(m => m.apiKey && m.model);  // 只保留填了 Key 和 Model 的
-      
+        const base = cleanApiBase(fs.querySelector('.m_base').value);
+        const key = cleanCfgStr(fs.querySelector('.m_key').value);
+        const model = cleanCfgStr(fs.querySelector('.m_model').value);
+        return { apiBase: base, apiKey: key, model: model, _label: '并行模型' + (i + 1) };
+      }).filter(m => m.apiKey && m.model);
       saveCfg();
       log('多模型配置已保存（共 ' + cfg.models.length + ' 个模型）');
       renderModelsList();
@@ -2772,12 +3990,10 @@
   function renderJobsTab() {
     bodyEl.innerHTML =
       '<fieldset><legend>抓取收藏岗位</legend>' +
-      '<div class="hint">先在网页版进入你的「收藏/沟通过」列表页，把页面<strong>滚到底</strong>（懒加载全部出来后）再点按钮。脚本用 DOM 识别岗位卡片，不依赖具体接口参数，改版了也大概率能用。</div>' +
       '<div class="btns"><button class="act pri" id="j_here">抓当前页</button>' +
       '<button class="act" id="j_pages">自动翻页抓</button><input id="j_np" value="3" style="flex:0 0 54px">' +
       '<button class="act" id="j_detail">抓选中岗位详情</button></div>' +
       '<div class="btns"><button class="act" id="j_all">全选/取消</button><button class="act warn" id="j_clear">清空列表</button></div>' +
-      '<label class="mini">选中 = 加入队列：<strong>新抓到的岗位默认一条都不勾</strong>，勾上哪条才处理哪条，勾上时缺 JD 的会顺手去后台抓详情。取消勾选会立刻丢掉那条<strong>未发送</strong>的草稿（已发送的保留，避免重复发同一个 HR）。</label>' +
       '</fieldset><div id="j_list"></div>';
 
     $('#j_here', bodyEl).addEventListener('click', async () => { scrapeCurrentPage(); await autoDetailsAfterScrape(); });
@@ -2933,30 +4149,6 @@
       '<span class="mini" style="flex:0 0 auto">' + (cfg.autoSend ? '全自动' : '半自动') + '</span>' +
       (isRunning() || !planLeft(readPlan()).length ? '' :
         '<button class="act pri" id="q_resume">继续上次批量（剩 ' + planLeft(readPlan()).length + ' 条）</button>') +
-      '</div>' +
-      '<div class="hint">队列 = 「岗位」页里当前勾选的岗位（共 ' + selCount() + ' 个）：新抓到的岗位默认一条都不勾，勾上才进队列、缺 JD 的才自动去后台抓；取消勾选立刻从这里消失，未发送的草稿一并丢掉。' +
-      '生成前每条都得先有 JD（详情页正文）：没抓到的不会进模型，按钮显示「补抓详情并生成」，点一下先抓再写。' +
-      '<br>「开始批量」时生成按 <b>' + Math.min(8, Math.max(1, Math.round(Number(cfg.genConcurrency) || 3))) + ' 路并发</b>同时跑（' +
-      (cfg.autoSend ? '但发送仍然逐条排队、每条之间照旧等间隔' : '半自动没有发送，纯靠它把生成阶段提速') +
-      '），所以哪条先生成完就先排到前面；并发数在「设置」页调，服务商限流就调回 1。' +
-      '<br>' + (cfg.bgExecutor
-        ? '<b>这一轮由脚本自己开的一个后台「生成器」标签页来跑</b>' + (planOwnerLive(readPlan()) ? '（现在正在跑的就是它）' : '') +
-          '：生成招呼语只要读存储里的简历/JD 再打一次大模型请求，根本不需要你看的那一页，所以循环不长在页面里 —— ' +
-          '<b>你跳到别的岗位、翻页、关面板都不会打断它</b>，「是否离开网站？」那种弹窗也不会再出现。' +
-          '这一页标题写着「招呼语生成器 · 请别关这个标签页」，跑完（或剩的跑不动了）自己关闭；' +
-          '提前关掉它也不会把已经生成的草稿弄丢，十几秒后会自动再开一个接着跑剩下的。'
-        : '「设置」里关掉了「生成器标签页」，所以这一轮跑在你正看着的这一页里：' +
-          '切面板里的标签、最小化面板都不打断，但整页跳走会 —— 那一页的脚本上下文当场销毁。' +
-          '因此每一轮开始就把「要跑哪几条」写进油猴存储，回来这一页会认这份计划：' +
-          '队列页给你「继续上次批量（剩 N 条）」，勾着「页面跳转后自动接着跑」时它自己接上。') +
-      '<br>已经发给某个 HR 的那条不会被重发：真发出去的那一瞬间由发的那一页留一条持久凭证（' + SENT_KEY('…') + '），续跑先认它。' +
-      (cfg.autoSend
-        ? '当前是全自动：行内那颗按钮就叫「生成并发送」，点一下直接生成＋发出，不用再点第二次；「发送」和「开始批量」也照旧 —— 都会' +
-          (cfg.sendViaList ? '另开一个列表页标签，在这条岗位自己的卡片上点「继续沟通/立即沟通」一步进沟通页' : '另开该岗位的详情页，在里面点沟通入口进沟通页') +
-          '，填、发都不用你切页面。'
-        : '当前是半自动：你就站在沟通页时当场填好、由你按 Enter 或点站点「发送」；不在沟通页时' +
-          (cfg.sendViaList ? '脚本另开一个列表页标签走到这个岗位的沟通页，只把话填好就停手' : '脚本另开该岗位的详情页走到沟通页，只把话填好就停手') +
-          '，队列标「已填待确认」，最后那一下留给你。') +
       '</div>' +
       '</fieldset><div id="q_list"></div>';
 
@@ -3163,7 +4355,8 @@
     const min = $('#bgMin'); if (min) min.style.display = 'none';
   });
   GM_registerMenuCommand('重置全部本地数据', () => {
-    [K.cfg, K.resume, K.jobs, K.details, K.drafts, K.stats, K.pending, K.batch, K.logbuf, K.exec, K.execLog].forEach((k) => GM_deleteValue(k));
+    [K.cfg, K.resume, K.jobs, K.details, K.drafts, K.stats, K.pending, K.batch, K.logbuf, K.exec, K.execLog,
+     K.scoutCfg, K.scoutProgress, K.scoutReport].forEach((k) => GM_deleteValue(k));
     const swept = sweepSentCreds();   // 每条岗位的「已发出」凭证是一条一个键，按前缀扫掉
     log('已清空' + (swept ? '（含 ' + swept + ' 条「已发出」凭证）' : '') + '，刷新页面生效');
   });

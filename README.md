@@ -4,7 +4,7 @@
 
 单文件、无构建、无后端。简历、岗位、草稿、API Key 都只存在本机 Tampermonkey 的存储里。
 
-> 当前版本 **v0.5.9**。界面与文档均为中文，目标站点是 BOSS 直聘网页版（zhipin.com）。
+> 当前版本 **v0.6.0**。界面与文档均为中文，目标站点是 BOSS 直聘网页版（zhipin.com）。
 
 ```
 收藏/感兴趣列表 ──「抓当前页」──> 岗位库（新抓的默认不勾选）
@@ -54,7 +54,7 @@
 
 装好后打开任意 BOSS 页面，右下角出现 **「打招呼助手」** 悬浮按钮；`Alt+P` 显示 / 隐藏面板。油猴菜单里还有「打开/显示助手面板」和「重置全部本地数据」。
 
-> 面板标题会显示版本号（如 `v0.5.9`）。**升级必须整份文件替换**：油猴里的「更新」不会拿到你本地改过的版本。标题栏版本没变，就说明还跑着旧脚本。
+> 面板标题会显示版本号（如 `v0.6.0`）。**升级必须整份文件替换**：油猴里的「更新」不会拿到你本地改过的版本。标题栏版本没变，就说明还跑着旧脚本。
 
 ---
 
@@ -161,7 +161,34 @@ JD 正文参与草稿指纹，所以补抓到 / 更新 JD 会让旧草稿自动�
 - 先等按钮出现（最多 20 × 250ms），再等它摘掉 `disabled`（`disabled` 在空输入时是 **class**，不是属性），等不到也点一下，最终仍以输入框是否清空为准；
 - 仍然排除任何上传 / 表情 / 图片控件（`isUploadish`），不会弹出系统选图框。
 
-回归 fixture 已改成真实的 `<div class="btn-v2 btn-sure-v2">`。把选择器退回旧写法，立刻有 16 条断言变红；恢复后 257 条闭环断言全绿。
+回归 fixture 已改成真实的 `<div class="btn-v2 btn-sure-v2">`。把选择器退回旧写法，立刻有 16 条断言变红；恢复后 260 条闭环断言全绿。
+
+### v0.6.0：不再往错的输入框里填字，也不再抓侧栏推荐岗
+
+用户截图反馈了两处回归 —— 都是前面版本已经做对、这一版反而错了：
+
+**1. 招呼语被填进了「VIP 兑换码」输入框（图1），而不是走「点岗位卡片自己的立即沟通 → 进这个岗位的沟通页 → 填框 → 点发送」（图3、4）。** 日志连报 `找到了输入框但没找到「发送」按钮，也没能用回车发出去`。
+
+根因是 `findChatInput()` 的兜底启发式太宽：它把「页面下半屏、宽度 > 120 的可见 `input[type=text]`」都当聊天框，只按 placeholder 排除了搜索/手机号/账号/密码/验证 —— VIP 兑换码框全部命中。于是招呼语填进了兑换码框、找不到发送按钮；又因为「找到了输入框」，脚本没有退回「另开标签页去沟通页」的正路，一条也发不出去。
+
+现在的判据只有一条：**必须是聊天容器里的可编辑区**（`contenteditable` 或 `textarea`，且通过 `isChatComposer()`），`<input>` 永远不算聊天框。另外两道闸：
+
+- `sendIntoChat()` 动手前再确认一次，不是真聊天框就一个字都不填；
+- `sendMessage()` 先判会话身份，明确是别的岗位的会话就停手（`unknown` 才按你点的那条发，并在日志里提醒核对）。
+
+你当前页不是沟通页时，现在会按设计退回「另开标签页 → 到这个岗位的沟通页 → 只填不发」。
+
+**2. 「抓当前页」把右侧「谁看过我 / 对我感兴趣的」里的岗位也抓了（图2 打叉的那几条）。** 旧版 `scrapeCurrentPage()` 把整页所有 `a[href*=job_detail]` 都当收藏岗位。
+
+现在分三层，从精确到兜底：
+
+- 先只扫主列表容器（`.job-list-box` 等三档选择器，且容器宽度 ≥ 45% 视口）；
+- 侧栏模块按标题 `谁看过我` / `对我感兴趣的` 识别并整体排除；
+- 认不出主列表容器时退回整页扫描，但用「卡片宽度 ≥ 本页最宽卡片的 55%（且 ≥ 320px）」挡掉窄卡片。
+
+抓取日志会写明这次走了哪条路、排除了几张侧栏卡片。**旧数据要清一次**：升级后先「清空列表」再重抓，否则之前混进来的侧栏岗位还留在岗位库里。
+
+回归用例：scraper 组加了侧栏 fixture（主列 68% / 侧栏 28%）和「认不出容器」的兜底场景；ui-smoke 加了一颗可见的「输入道具VIP兑换码」输入框，断言它一个字都不沾。把新判据退回旧写法（`tmp/mut-060.js`），两组都会变红 —— 其中 ui-smoke 的破坏版会把招呼语原样打进 VIP 框，和用户截图一致。
 
 ---
 
@@ -335,6 +362,9 @@ https://cdn.staticfile.net/pdf.js/3.11.174/pdf.min.js
 **「抓当前页」后队列是空的？**
 正常。v0.5.1 起新抓到的岗位默认不勾选，勾上才进队列、才自动抓 JD。想全选，用岗位页的「全选/取消」。
 
+**「抓当前页」把右侧「谁看过我 / 对我感兴趣的」也抓进来了？**
+v0.6.0 起不会。旧版整页扫岗位链接，右侧推荐也是同样的写法，于是混了进来。升级后先「清空列表」再重抓一次；日志里会写「已忽略…侧栏」或「排除 N 个侧栏窄卡片」。
+
 **标题栏「详情」一直是 0？**
 先确认岗位已勾选。再查日志：有没有「打开 N 个后台标签抓详情」和「详情回收进度 1/N」。一直 0/N 通常是详情页被登录墙挡住、没加载完，或这条岗位没有详情页链接。别把那一批后台标签秒关。
 
@@ -345,7 +375,7 @@ https://cdn.staticfile.net/pdf.js/3.11.174/pdf.min.js
 v0.5.1 起不用了：全自动下按钮写着「生成并发送」。如果只看到「生成」，说明当前是半自动（队列页顶部有模式标签），或者面板还是旧版本。它只会在两种情况下停在没发：到了今日上限，或 JD 还没回来。
 
 **发送日志写「找到了输入框但没找到『发送』按钮」，或后台标签 60 秒没回执？**
-先看日志走的是哪个入口。v0.5.9 已按真实站点把候选范围扩到 `div.btn-v2.btn-sure-v2` 并保留精确文案「发送」；如果仍失败，按 F12 看一下沟通页那颗按钮的真实标签/文案，再对照「关键选择器」。列表入口超时则先看日志有没有「列表入口没走通…」，再看后台标签停在列表页还是已经跳到沟通页。
+先看日志走的是哪个入口。v0.5.9 已按真实站点把候选范围扩到 `div.btn-v2.btn-sure-v2` 并保留精确文案「发送」。v0.6.0 起这句只可能出现在**真正的沟通页**里：没进沟通页时脚本不会再从页面上随便找一个输入框，而是另开标签页。如果仍失败，按 F12 看一下沟通页那颗按钮的真实标签/文案，再对照「关键选择器」。列表入口超时则先看日志有没有「列表入口没走通…」，再看后台标签停在列表页还是已经跳到沟通页。
 
 **日志先出现「列表入口没走通，退回岗位详情页入口」，会发两遍吗？**
 不会。这句只在一条字节都没发出去时出现，退回后才真的发一次，队列只计一次。若是会话身份明确对不上，脚本只停手、不换入口重试。
@@ -395,11 +425,12 @@ v0.5.4 起不会，因为回写只盖自己动过的那一条。若还遇到，�
 | 位置 | 选择器 / 特征 |
 | --- | --- |
 | 岗位卡片链接 | `a[href*="job_detail"]`、`a[href*="jobDetail"]`、`a[href*="/job/"]`，需可见且文本 2–80 字 |
+| 抓取范围（v0.6.0） | 主列表按精确度三档：`.job-list-box` / `[class*="job-list-container"]`、`[class*="job-list-wrap"]` / `[class*="job-list"]`，容器宽度需 ≥ 45% 视口；右侧 `谁看过我` / `对我感兴趣的` 按标题识别并整体排除；认不出容器时退回整页，但只收宽度 ≥ `max(320, 本页最宽卡片×0.55)` 的卡片 |
 | 卡片字段 | `.job-name` / `.salary` / `a[href*="company"]` / `.company-location` / `.tag-list` |
 | 下一页按钮 | `[class*="next"] button`、`.ui-icon-chevronright`、文本「下一页」 |
 | 沟通入口（详情页） | `<div class="btn btn-startchat-wrap">` 内套 `<a class="btn btn-startchat" redirect-url="/web/geek/chat?id=…&jobId=…&securityId=…">`；`data-isfriend="true"` 时文案是「继续沟通」。事件绑在 `<a>` 上，必须剔掉包含候选的外层 `<div>` |
 | 沟通入口（列表卡片） | 卡片右上角、与 `.info-primary` 同层或上一层的 `.op-list` 里：`<div class="btn btn-startchat-wrap" style="display:none"><a class="btn btn-startchat" redirect-url="…jobId=…">`。平时 `display:none`，需先补发 `pointerover/mouseover/mousemove` 再 `click()` |
-| 聊天输入框 | `div.chat-input[contenteditable="true"]`（层级：`chat-conversation > message-controls > chat-im.chat-editor > editor-container`）。`position:fixed` 元素 `offsetParent` 为 null，可见性判断不能只看它 |
+| 聊天输入框 | `div.chat-input[contenteditable="true"]`（层级：`chat-conversation > message-controls > chat-im.chat-editor > editor-container`）。v0.6.0 起**只认聊天容器里的可编辑区**（`contenteditable` / `textarea` 且通过 `isChatComposer()`），`<input>` 永远不算 —— 收藏页的 VIP 兑换码框、搜索框都在线外。`position:fixed` 元素 `offsetParent` 为 null，可见性判断不能只看它 |
 | 发送按钮（v0.5.9） | 真实站点的操作按钮组件类是 `div.btn-v2.btn-sure-v2`，文案精确为「发送」；空输入时 `disabled` 只是 **class**，填字后框架自己摘掉。沟通页那颗未能直接抓到，所以候选范围同时覆盖 `button` / `[role=button]` / `[class*="send"]`；文案若是「提交」，只认右侧面板（`left >= innerWidth*0.28`） |
 | 会话身份 | `performance.getEntriesByType('navigation')[0].name` 里的 `jobId` / `securityId`；右侧 `span.position-name`（限定 `rect.left >= innerWidth*0.28`） |
 | 需要排除 | 沟通页工具栏上的 `input[type=file]`（图片上传常是 0×0 且 `opacity:0`），以及脚本自己面板里的 `<textarea>` |
@@ -420,13 +451,13 @@ test/                           回归测试
 
 ```bash
 # 需要 Node.js，以及本机已安装的 Edge 或 Chrome
-node test/run.js               # 全套：34 个套件、547 条断言
+node test/run.js               # 全套：34 个套件、554 条断言
 node test/run.js ui-smoke      # 只跑一组（按 URL / 套件名子串过滤）
 node test/run.js ui-exec       # 后台生成器 8 个 case
 node test/build-ui.js          # 改过 fixture 后先重建；只有 scraper / ui-smoke / ui-exec?case=ok / pdf-main 这几条 suite 会自动 build，其它 case 复用同一批 HTML
 ```
 
-套件分组：`ui-smoke`（端到端闭环 257）、`ui-exec`（生成器 8 case 73）、`sendtab`（10）、`ui-detail`（13）、`ui-hop`（7 case 54）、`listsend`（12 case 95）、`scraper`（24）、`pdf`（三个场景 21）。
+套件分组：`ui-smoke`（端到端闭环 260）、`ui-exec`（生成器 8 case 73）、`sendtab`（10）、`ui-detail`（13）、`ui-hop`（7 case 54）、`listsend`（12 case 95）、`scraper`（28）、`pdf`（三个场景 21）。
 
 测试形态：
 
@@ -498,7 +529,10 @@ headless 用的是虚拟时间，真实墙钟比预算小得多；`ui-smoke` 里
 
 ## 版本
 
-当前 **v0.5.9**。面板标题、启动日志都会打印版本号，报 Issue 时请一并附上。
+当前 **v0.6.0**。面板标题、启动日志都会打印版本号，报 Issue 时请一并附上。
+
+**0.6.0 — 修「填错输入框」和「抓进侧栏岗位」**
+`findChatInput()` 只认聊天容器里的可编辑区（`contenteditable` / `textarea`），`<input>` 永远不算；`sendIntoChat()` 和 `sendMessage()` 各加一道闸，没进沟通页就另开标签页，不再把招呼语填进 VIP 兑换码框。抓取改为「主列表容器 → 侧栏标题排除 → 卡片宽度兜底」三层，只抓「职位收藏」主列表。两组回归用例都能把旧写法打红。
 
 **0.5.9 — 修「最早的发送都失败了」**
 真实站点的这组操作按钮是 `<div class="btn-v2 btn-sure-v2">`（同组件在会话列表搜索按钮上实测），不是 `<button>`，旧选择器只查 `button, [role=button]`，于是输入框找到了、发送按钮永远匹配不到，全线报「找到了输入框但没找到『发送』按钮」。现在候选范围覆盖 `.btn-v2` / `.btn-sure-v2` / `[class*="send"]`，文案仍精确「发送」，「提交」只认右侧面板；`clickSendButton` 先等按钮出现、再等它摘掉 `disabled`。fixture 改成真实的 `div` 写法，旧选择器会让 16 条断言变红。
