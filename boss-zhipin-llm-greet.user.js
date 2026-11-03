@@ -2,7 +2,7 @@
 // @name         BOSS直聘 · 岗位筛选与打招呼助手
 // @namespace    qoder.boss.assistant
 // @version      0.7.1
-// @description  两部分功能：(1) 按城市/薪资/时长/出勤/招聘者活跃度/简历匹配度自动筛选并收藏岗位；(2) 读取收藏的岗位，连同本地简历一起交给大模型生成个性化打招呼语，再半自动/自动发送给 HR
+// @description  两部分功能：(1) 按薪资/时长/出勤/招聘者活跃度/简历匹配度自动筛选并收藏岗位；(2) 读取收藏的岗位，连同本地简历一起交给大模型生成个性化打招呼语，再半自动/自动发送给 HR
 // @match        https://www.zhipin.com/*
 // @match        https://*.zhipin.com/*
 // @run-at       document-idle
@@ -30,15 +30,15 @@
  * 注意：IE 无法运行（油猴没有 IE 版本，BOSS 直聘网页版也不支持 IE），必须用 Edge 或 Chrome。
  *
  * v0.7.0 两部分功能：
- *   第一部分【筛选】：在「筛选」tab 配置城市/口径/目标数，打开 BOSS 实习列表页后点「开始筛选当前页」
- *                    或「批量筛选所有城市」，脚本自动按日薪/时长/出勤/招聘者活跃度/简历匹配度过滤，
+ *   第一部分【筛选】：在「筛选」tab 配置口径/目标数，打开 BOSS 实习列表页后点「开始筛选当前页」，
+ *                    脚本自动按日薪/时长/出勤/招聘者活跃度/简历匹配度过滤，
  *                    合格的点收藏，不合格的跳过并记录原因。
  *   第二部分【打招呼】：在「岗位」tab 抓取收藏的岗位 → 「队列」tab 生成招呼语 → 发送。
  *
  * 首次使用顺序：
  *   1) 「设置」tab 填 API Key / Model
  *   2) 「简历」tab 选 PDF 或粘文本
- *   3) 「筛选」tab 配置城市与口径，开始筛选并收藏
+ *   3) 「筛选」tab 配置口径，开始筛选并收藏
  *   4) 收藏完成后，去「岗位」tab 抓当前页（BOSS 收藏列表页）
  *   5) 勾上要处理的岗位 → 「队列」tab 生成 → 发送
  */
@@ -64,7 +64,7 @@
     exec: 'bgExec',         // 面板递给「生成器」标签页的交接单（跑哪几条、被谁认领了）
     execLog: 'bgLogExec',   // 生成器那一页自己的日志副本（和面板那份分开，两边不互相盖）
     // v0.7.0 筛选功能新增
-    scoutCfg: 'scoutCfg',   // 筛选配置（城市、口径、目标数）
+    scoutCfg: 'scoutCfg',   // 筛选配置（口径、目标数）
     scoutProgress: 'scoutProgress', // 筛选进度（已收藏、已跳过、当前状态）
     scoutReport: 'scoutReport'      // 筛选报告（本轮收藏的岗位清单）
   };
@@ -302,14 +302,6 @@
 
   // 筛选默认配置
   const SCOUT_DEFAULTS = {
-    // 目标城市与 URL
-    cities: [
-      { name: '北京', code: '101010100' },
-      { name: '上海', code: '101020100' },
-      { name: '杭州', code: '101210100' },
-      { name: '武汉', code: '101200100' }
-    ],
-    currentCity: 0,           // 当前处理的城市索引
     targetCount: 20,          // 目标收藏数
     // 筛选口径
     maxMonths: 3,             // 实习时长上限（月）
@@ -325,10 +317,17 @@
     aiKeywords: ['LangGraph', 'LangChain', 'RAG', 'Agent', 'Prompt', 'Function Calling', '向量', 'Milvus', 'Qdrant', 'pgvector', 'FastAPI', 'SSE', '大模型', 'AI'],
     // 硬伤关键词
     hardInjuries: ['2027届', '2026届', '27届', '26届', '985', '211', '双一流', '硕士', '博士', 'C++', '算法研究', '纯前端', '硬件', '嵌入式', '测试'],
+    hardInjuriesEnabled: true,   // 硬伤关键词开关
     // 运行控制
     autoScroll: true,         // 自动滚动加载更多
     maxScrollTimes: 10,       // 最多滚动次数
-    delayBetweenActions: 1500 // 操作间隔（毫秒，防风控）
+    delayBetweenActions: 1500, // 操作间隔（毫秒，防风控）
+    // 关键词加权打分（非硬性，总分 ≥ bonusThreshold 才收藏；0 = 跳过此关卡）
+    // 每个技能项：{ name: 主名称, aliases: [别名…], weight: 权重 }
+    // aliases 非空时只用别名匹配（避免 name 重复计分），为空时只用 name 匹配
+    bonusKeywords: [],
+    bonusKeywordsEnabled: true, // 关键词打分开关
+    bonusThreshold: 5         // 关键词总分阈值
   };
 
   // 筛选运行时状态
@@ -378,28 +377,37 @@
     return { ok: false, level: 'none', status: '离线/未活跃' };
   }
 
-  // 评估简历匹配度（关键词命中）
-  function evaluateResumeMatch(text, resumeText) {
-    const t = (text || '').toUpperCase();
-    const resume = (resumeText || '').toUpperCase();
-    // Java 后端线
-    let javaHits = 0;
-    for (const kw of scoutCfg.javaKeywords) {
-      if (t.includes(kw.toUpperCase()) && resume.includes(kw.toUpperCase())) javaHits++;
+  // 关键词加权打分（非硬性，返回总分和明细）
+  // 每个技能项：主名称 + 别名都是匹配词，命中任意一个即得分
+  // 单项得分 = weight（固定权重，不累加，每组最多得一次分）
+  function calcBonusScore(jdText) {
+    const keywords = scoutCfg.bonusKeywords || [];
+    const threshold = Number(scoutCfg.bonusThreshold) || 0;
+    const jd = (jdText || '').toLowerCase();
+    let totalScore = 0;
+    const details = [];
+
+    for (const item of keywords) {
+      const name = item.name || '';
+      const aliases = Array.isArray(item.aliases) ? item.aliases.filter(Boolean) : [];
+      const weight = Math.max(0, Number(item.weight) || 1);
+      // 匹配词列表：主名称 + 所有别名
+      const matchWords = [name, ...aliases].filter(Boolean);
+      let hitWord = null;
+
+      for (const word of matchWords) {
+        const w = word.toLowerCase();
+        if (!w) continue;
+        if (jd.includes(w)) { hitWord = word; break; }
+      }
+
+      if (hitWord) {
+        totalScore += weight;
+        details.push({ name: name, matchedWord: hitWord, weight: weight, points: weight });
+      }
     }
-    // AI 应用线
-    let aiHits = 0;
-    for (const kw of scoutCfg.aiKeywords) {
-      if (t.includes(kw.toUpperCase()) && resume.includes(kw.toUpperCase())) aiHits++;
-    }
-    // 判定：任一线命中 4+ 关键词视为贴合
-    const javaOk = javaHits >= 4;
-    const aiOk = aiHits >= 2;  // AI 线关键词少，命中 2 个就算贴合
-    return {
-      pass: javaOk || aiOk,
-      javaHits, aiHits,
-      line: javaOk && aiOk ? 'both' : (javaOk ? 'java' : (aiOk ? 'ai' : 'none'))
-    };
+
+    return { score: totalScore, threshold: threshold, details: details, pass: threshold <= 0 || totalScore >= threshold };
   }
 
   // 检查硬伤（命中任一直接跳过）
@@ -412,9 +420,9 @@
     return { pass: hits.length === 0, hits };
   }
 
-  // 综合判定一个岗位是否应该收藏
+  // 第一阶段判定：卡片文本初筛（时长、日薪、出勤）
   // 返回 { pass: bool, reasons: string[], data: {...} }
-  function judgeJobCard(cardText, salary, resumeText) {
+  function judgeJobCard(cardText, salary) {
     const reasons = [];
     const data = {};
 
@@ -437,27 +445,24 @@
     if (days > scoutCfg.maxDaysPerWeek) { return { pass: false, reasons: ['出勤 ' + days + ' 天/周 > ' + scoutCfg.maxDaysPerWeek], data }; }
     else { reasons.push('出勤 ' + days + ' 天/周 ✓'); }
 
-    // 4. 招聘者状态
-    const recruiter = isRecruiterActive(cardText);
-    data.recruiter = recruiter;
-    if (!recruiter.ok) { reasons.push('招聘者状态未知'); }
-    else { reasons.push('招聘者 ' + recruiter.status + (recruiter.level === 'soft' ? ' (软合格)' : ' ✓')); }
-
-    // 5. 硬伤
-    const hardInj = checkHardInjuries(cardText);
-    data.hardInjuries = hardInj;
-    if (!hardInj.pass) { return { pass: false, reasons: ['硬伤: ' + hardInj.hits.join(',')], data }; }
-    else { reasons.push('无硬伤 ✓'); }
-
-    // 6. 简历匹配（可选，如果提供了简历文本）
-    if (resumeText && resumeText.length > 50) {
-      const match = evaluateResumeMatch(cardText, resumeText);
-      data.match = match;
-      if (!match.pass) { return { pass: false, reasons: ['简历匹配不足 (Java ' + match.javaHits + '/AI ' + match.aiHits + ')'], data }; }
-      else { reasons.push('简历匹配 ' + match.line + ' ✓'); }
-    }
-
     return { pass: true, reasons, data };
+  }
+
+  // 生成横线分隔式日志（方案A emoji + 时间戳）
+  function formatJobCard(title, company, salary, recruiterStatus, checks, resultLine) {
+    const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    const sep = '─'.repeat(40);
+
+    const lines = [];
+    lines.push('[' + ts + '] ' + sep);
+    lines.push('[' + ts + '] 📋 ' + title + (company ? ' | ' + company : ''));
+    lines.push('[' + ts + '] 💰 ' + salary + '元/天 | 👤 ' + (recruiterStatus || '未知'));
+    lines.push('[' + ts + '] ' + checks.map((c) => (c.pass ? '✅' : '❌') + ' ' + c.label).join(' | '));
+    if (resultLine) {
+      lines.push('[' + ts + '] ' + resultLine);
+    }
+    lines.push('[' + ts + '] ' + sep);
+    return lines.join('\n');
   }
 
   // 从详情面板读取招聘者状态
@@ -587,11 +592,48 @@
       log('[收藏] 找到详情面板容器');
     }
     
-    // 3.5 读取招聘者状态（如果详情面板没找到，会在全页面搜索）
+    // 3.5 提取详情面板完整 JD 文本
+    const detailText = detailPanel
+      ? (detailPanel.innerText || '').replace(/\s+/g, ' ').trim()
+      : '';
+    log('[收藏] 详情面板文本长度: ' + detailText.length);
+    if (detailText) log('[收藏] 详情面板文本片段: ' + detailText.substring(0, 300));
+
+    // 3.6 读取招聘者状态（如果详情面板没找到，会在全页面搜索）
     const recruiterStatus = readRecruiterStatusFromDetail(detailPanel);
     log('[收藏] HR状态: ' + (recruiterStatus || '未知'));
-    
-    // 4. 在详情面板里查找收藏按钮
+
+    // 3.7 第二阶段检查：HR 活跃度
+    const hrStatuses = scoutCfg.hrActiveStatus || [];
+    if (recruiterStatus && hrStatuses.length > 0 && !hrStatuses.includes(recruiterStatus)) {
+      log('[收藏] HR状态不符: ' + recruiterStatus + '，不在允许列表');
+      return { ok: false, why: 'HR状态不符: ' + recruiterStatus, recruiterStatus, detailText };
+    }
+
+    // 3.8 第二阶段检查：硬伤关键词（开关开启时）
+    if (scoutCfg.hardInjuriesEnabled !== false) {
+      const hardInj = checkHardInjuries(detailText);
+      if (!hardInj.pass) {
+        log('[收藏] 硬伤关键词命中: ' + hardInj.hits.join(','));
+        return { ok: false, why: '硬伤: ' + hardInj.hits.join(','), recruiterStatus, detailText };
+      }
+    }
+
+    // 3.9 第二阶段检查：关键词加权打分（开关开启时）
+    if (scoutCfg.bonusKeywordsEnabled !== false) {
+      const bonus = calcBonusScore(detailText);
+      const hasKeywords = (scoutCfg.bonusKeywords || []).length > 0;
+      const thresholdActive = bonus.threshold > 0 && hasKeywords;
+      if (thresholdActive) {
+        if (!bonus.pass) {
+          log('[收藏] 关键词得分不足: ' + bonus.score + ' < ' + bonus.threshold);
+          return { ok: false, why: '关键词得分 ' + bonus.score + ' < 阈值 ' + bonus.threshold, recruiterStatus, detailText };
+        }
+        log('[收藏] 关键词得分: ' + bonus.score + ' ✓');
+      }
+    }
+
+    // 4. 全部检查通过，在详情面板里查找收藏按钮
     let btns = [];
     if (detailPanel) {
       btns = $$('a, button, span, div', detailPanel).filter((e) => {
@@ -665,7 +707,6 @@
   // 返回 { favorited: [...], skipped: [...], error: string|null }
   async function runScoutInCurrentPage(startIndex = 0) {
     const result = { favorited: [], skipped: [], error: null };
-    const resumeText = getResume();
     const targetCount = scoutCfg.targetCount;
     const alreadyFavorited = (scoutProgress.favorited || []).slice();
 
@@ -727,6 +768,9 @@
         const cardText = (card.innerText || '').replace(/\s+/g, ' ').trim();
         const jobId = jobIdFromHref(a.href);
         const title = (a.innerText || a.getAttribute('title') || '').trim();
+        // 提取公司名
+        const compA = $$('a', card).find((x) => /company|gongsi/i.test(x.href || '') && x.innerText.trim().length > 1);
+        const company = compA ? compA.innerText.replace(/\s+/g, ' ').trim() : '';
 
         // 检查是否已收藏（去重）
         if (alreadyFavorited.some((j) => j.id === jobId) || result.favorited.some((j) => j.id === jobId)) {
@@ -749,11 +793,12 @@
           log('· 使用 API 薪资数据: ' + salary + ' (DOM: ' + domSalary + ')');
         }
 
-        // 第一阶段：卡片文本初筛（时长、日薪、出勤、硬伤、简历匹配）
-        const verdict = judgeJobCard(cardText, salary, resumeText);
+        // 第一阶段：卡片文本初筛（时长、日薪、出勤）
+        const verdict = judgeJobCard(cardText, salary);
         if (!verdict.pass) {
           result.skipped.push({ id: jobId, title, why: verdict.reasons.join('; ') });
-          log('· 跳过: ' + title + ' - ' + verdict.reasons.join('; '));
+          const checks = verdict.reasons.map((r) => ({ label: r, pass: r.includes('✓') }));
+          log(formatJobCard(title, company, salary, '', checks, '❌ 跳过'));
           scoutProgress.currentIndex = i;
           scoutProgress.currentJobId = jobId;
           updateScoutLiveUI();
@@ -765,25 +810,9 @@
           continue;
         }
 
-        // 第二阶段：打开详情面板，读取 HR 状态并收藏
+        // 第二阶段：打开详情面板，执行详情检查（HR→硬伤→关键词）并收藏
         const favResult = await clickFavoriteButton(card);
         const recruiterStatus = favResult.recruiterStatus;
-
-        // 检查 HR 状态是否符合筛选条件
-        const hrStatuses = scoutCfg.hrActiveStatus || [];
-        if (recruiterStatus && hrStatuses.length > 0 && !hrStatuses.includes(recruiterStatus)) {
-          result.skipped.push({ id: jobId, title, why: 'HR状态不符: ' + (recruiterStatus || '未知') });
-          log('· 跳过 (HR状态不符): ' + title + ' - HR状态: ' + (recruiterStatus || '未知'));
-          scoutProgress.currentIndex = i;
-          scoutProgress.currentJobId = jobId;
-          updateScoutLiveUI();
-          await sleepInterruptible(scoutCfg.delayBetweenActions);
-          if (!scoutProgress.running || scoutProgress.paused) {
-            log('· 筛选已暂停/停止');
-            return result;
-          }
-          continue;
-        }
 
         if (favResult.ok) {
           const jobInfo = {
@@ -797,7 +826,11 @@
           };
           result.favorited.push(jobInfo);
           scoutProgress.favorited.push(jobInfo);
-          log('✓ 收藏: ' + title + ' | ' + salary + ' | HR:' + (recruiterStatus || '未知') + ' | ' + verdict.reasons.slice(0, 3).join('; '));
+          const checks = [
+            ...verdict.reasons.map((r) => ({ label: r, pass: true })),
+            { label: '关键词通过', pass: true }
+          ];
+          log(formatJobCard(title, company, salary, recruiterStatus, checks, '⭐ 已收藏'));
           saveScoutProgress();
           saveScoutReport();
 
@@ -810,8 +843,12 @@
             return result;
           }
         } else {
-          result.skipped.push({ id: jobId, title, why: '收藏失败: ' + favResult.why });
-          log('· 收藏失败: ' + title + ' - ' + favResult.why);
+          result.skipped.push({ id: jobId, title, why: favResult.why });
+          const checks = [
+            ...verdict.reasons.map((r) => ({ label: r, pass: true })),
+            { label: favResult.why, pass: false }
+          ];
+          log(formatJobCard(title, company, salary, recruiterStatus, checks, '❌ 跳过'));
         }
 
         // 保存当前位置
@@ -871,56 +908,6 @@
 
     log('▶ 筛选结束：本轮收藏 ' + result.favorited.length + ' 个，跳过 ' + result.skipped.length + ' 个');
     return result;
-  }
-
-  // 批量筛选：按城市列表依次处理
-  async function runScoutAllCities() {
-    scoutProgress.running = true;
-    scoutProgress.paused = false;
-    scoutProgress.favorited = scoutProgress.favorited || [];
-    scoutProgress.skipped = [];
-    saveScoutProgress();
-
-    log('=== 批量筛选启动 ===');
-    log('· 目标城市: ' + scoutCfg.cities.map((c) => c.name).join(', '));
-    log('· 目标收藏总数: ' + scoutCfg.targetCount);
-
-    for (let i = 0; i < scoutCfg.cities.length; i++) {
-      if (!scoutProgress.running) break;
-      if (scoutProgress.favorited.length >= scoutCfg.targetCount) break;
-
-      const city = scoutCfg.cities[i];
-      scoutCfg.currentCity = i;
-      saveScoutCfg();
-
-      log('▶ 开始处理城市: ' + city.name + ' (已收藏 ' + scoutProgress.favorited.length + '/' + scoutCfg.targetCount + ')');
-
-      // 构造该城市的 URL
-      const url = 'https://www.zhipin.com/web/geek/jobs?city=' + city.code + '&jobType=1902&experience=108&degree=203';
-
-      // 打开该城市的列表页（在当前标签页跳转）
-      location.href = url;
-      await sleep(5000);  // 等页面加载
-
-      // 在该页面运行筛选
-      const result = await runScoutInCurrentPage();
-
-      if (result.error) {
-        log('✗ 城市 ' + city.name + ' 出错: ' + result.error);
-      }
-
-      // 如果已达到目标，提前结束
-      if (scoutProgress.favorited.length >= scoutCfg.targetCount) {
-        log('✓ 已达到总目标 ' + scoutCfg.targetCount + '，停止后续城市');
-        break;
-      }
-    }
-
-    scoutProgress.running = false;
-    saveScoutProgress();
-    log('=== 批量筛选结束 ===');
-    log('· 总收藏: ' + scoutProgress.favorited.length);
-    log('· 总跳过: ' + scoutProgress.skipped.length);
   }
 
   // 从网页/文档里复制 API Base / Key 时，零宽空格、BOM、方向控制符、换行、制表符等都会一起被带进来。
@@ -3424,6 +3411,10 @@
   #bgBody{padding:8px 10px;overflow:auto;max-height:calc(80vh - 88px)}
   #bgBody fieldset{border:1px solid #e6ebf2;border-radius:6px;margin:0 0 8px;padding:6px 8px}
   #bgBody legend{padding:0 4px;font-size:11.5px;color:#7a8698}
+  #bgBody .collapsible-fieldset .fieldset-legend-toggle{cursor:pointer;user-select:none}
+  #bgBody .collapsible-fieldset .fieldset-legend-toggle .toggle-icon{display:inline-block;margin-right:4px;transition:transform 0.2s;font-size:10px}
+  #bgBody .collapsible-fieldset.collapsed .fieldset-content{display:none}
+  #bgBody .collapsible-fieldset.collapsed .toggle-icon{transform:rotate(-90deg)}
   #bgBody label{display:block;margin:3px 0 1px;font-size:11.5px;color:#5a6675}
   #bgBody input,#bgBody textarea,#bgBody select{width:100%;padding:5px 7px;border:1px solid #d8dee8;border-radius:5px;font-size:12px;background:#fff}
   #bgBody textarea{resize:vertical}
@@ -3438,6 +3429,14 @@
   #bgBody .job .t b{display:block;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #bgBody .job .t i{display:block;font-style:normal;color:#7a8698;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #bgBody .st{font-size:10.5px;padding:1px 5px;border-radius:8px;background:#eef2f7;color:#5a6675;white-space:nowrap}
+  #bgBody .kw-row{display:flex;gap:4px;align-items:center;margin:3px 0}
+  #bgBody .kw-name{flex:2;min-width:0}
+  #bgBody .kw-aliases{flex:3;min-width:0}
+  #bgBody .kw-weight{flex:0 0 50px!important;width:50px!important}
+  #bgBody .kw-del{flex:0 0 auto!important;width:24px!important;padding:2px 0!important;border:1px solid #e8543f!important;background:#fff!important;color:#e8543f!important;border-radius:4px!important;cursor:pointer;font-size:14px!important;line-height:1.2!important}
+  #bgBody .injury-row{display:flex;gap:4px;align-items:center;margin:3px 0}
+  #bgBody .injury-word{flex:1;min-width:0}
+  #bgBody .injury-del{flex:0 0 auto!important;width:24px!important;padding:2px 0!important;border:1px solid #e8543f!important;background:#fff!important;color:#e8543f!important;border-radius:4px!important;cursor:pointer;font-size:14px!important;line-height:1.2!important}
   #bgBody .st.sent{background:#e6f6ec;color:#1c8a45}
   #bgBody .st.err{background:#fdeceb;color:#c8402f}
   #bgBody .st.run{background:#e8f1fd;color:#1a6fd8}
@@ -3602,6 +3601,115 @@
     }
   }
 
+  // 生成硬伤关键词区块的 HTML
+  function renderHardInjuriesHTML() {
+    const injuries = scoutCfg.hardInjuries || [];
+    const enabled = scoutCfg.hardInjuriesEnabled !== false;
+    const rows = injuries.map((word, i) =>
+      '<div class="injury-row" data-idx="' + i + '">' +
+      '<input class="injury-word" value="' + esc(word) + '" placeholder="硬伤词">' +
+      '<button class="injury-del" data-idx="' + i + '" type="button">×</button>' +
+      '</div>'
+    ).join('');
+    return '<fieldset class="collapsible-fieldset collapsed"><legend class="fieldset-legend-toggle"><span class="toggle-icon">▼</span> 硬伤关键词（命中任一直接跳过）</legend>' +
+      '<div class="fieldset-content">' +
+      '<label style="display:flex;align-items:center;gap:4px;font-size:12px;margin-bottom:6px">' +
+      '<input type="checkbox" id="s_injury_enabled" style="flex:0 0 14px"' + (enabled ? ' checked' : '') + '> 启用硬伤关键词检查</label>' +
+      '<div id="injury_list">' + rows + '</div>' +
+      '<button class="act" id="injury_add" type="button" style="margin-top:4px">+ 添加硬伤词</button>' +
+      '</div></fieldset>';
+  }
+
+  // 从 UI 收集硬伤关键词数据
+  function collectHardInjuriesFromUI() {
+    const rows = $$('#injury_list .injury-row', bodyEl);
+    const words = [];
+    rows.forEach((row) => {
+      const word = ($('.injury-word', row).value || '').trim();
+      if (word) words.push(word);
+    });
+    return words;
+  }
+
+  // 绑定硬伤关键词区块的动态事件（添加/删除）
+  function bindHardInjuriesEvents() {
+    $('#injury_add', bodyEl)?.addEventListener('click', () => {
+      scoutCfg.hardInjuries = collectHardInjuriesFromUI();
+      scoutCfg.hardInjuries.push('');
+      renderScout();
+    });
+    $('#injury_list', bodyEl)?.addEventListener('click', (e) => {
+      const btn = e.target.closest('.injury-del');
+      if (!btn) return;
+      scoutCfg.hardInjuries = collectHardInjuriesFromUI();
+      const idx = Number(btn.dataset.idx);
+      scoutCfg.hardInjuries.splice(idx, 1);
+      renderScout();
+    });
+  }
+
+  // 生成关键词加分区块的 HTML
+  function renderBonusKeywordsHTML() {
+    const keywords = scoutCfg.bonusKeywords || [];
+    const threshold = scoutCfg.bonusThreshold || 0;
+    const enabled = scoutCfg.bonusKeywordsEnabled !== false;
+    const rows = keywords.map((item, i) => {
+      const aliases = Array.isArray(item.aliases) ? item.aliases.join(', ') : '';
+      const weight = item.weight || 1;
+      return '<div class="kw-row" data-idx="' + i + '">' +
+        '<input class="kw-name" value="' + esc(item.name || '') + '" placeholder="技能项名称">' +
+        '<input class="kw-aliases" value="' + esc(aliases) + '" placeholder="别名（逗号分隔，可选）">' +
+        '<input class="kw-weight" type="number" value="' + esc(String(weight)) + '" min="1" max="10" style="width:50px">' +
+        '<button class="kw-del" data-idx="' + i + '" type="button">×</button>' +
+        '</div>';
+    }).join('');
+    return '<fieldset class="collapsible-fieldset collapsed"><legend class="fieldset-legend-toggle"><span class="toggle-icon">▼</span> 关键词加分（非硬性，总分 ≥ 阈值才收藏）</legend>' +
+      '<div class="fieldset-content">' +
+      '<label style="display:flex;align-items:center;gap:4px;font-size:12px;margin-bottom:6px">' +
+      '<input type="checkbox" id="s_bonus_enabled" style="flex:0 0 14px"' + (enabled ? ' checked' : '') + '> 启用关键词打分</label>' +
+      '<div class="row" style="align-items:center;gap:8px;margin-bottom:6px">' +
+      '<label style="font-size:12px">收藏阈值：</label>' +
+      '<input id="s_bonus_threshold" type="number" value="' + esc(String(threshold)) + '" min="0" style="width:60px">' +
+      '<span class="mini" style="color:#888">（0 = 跳过此关卡）</span>' +
+      '</div>' +
+      '<div id="kw_list">' + rows + '</div>' +
+      '<button class="act" id="kw_add" type="button" style="margin-top:4px">+ 添加技能项</button>' +
+      '</div></fieldset>';
+  }
+
+  // 从 UI 收集关键词数据
+  function collectBonusKeywordsFromUI() {
+    const rows = $$('#kw_list .kw-row', bodyEl);
+    const keywords = [];
+    rows.forEach((row) => {
+      const name = ($('.kw-name', row).value || '').trim();
+      if (!name) return; // 跳过空名称
+      const aliasesRaw = ($('.kw-aliases', row).value || '').trim();
+      const aliases = aliasesRaw ? aliasesRaw.split(/[,，]/).map((s) => s.trim()).filter(Boolean) : [];
+      const weight = Math.max(1, Math.min(10, Number($('.kw-weight', row).value) || 1));
+      keywords.push({ name: name, aliases: aliases, weight: weight });
+    });
+    return keywords;
+  }
+
+  // 绑定关键词区块的动态事件（添加/删除）
+  function bindBonusKeywordsEvents() {
+    $('#kw_add', bodyEl)?.addEventListener('click', () => {
+      scoutCfg.bonusKeywords = collectBonusKeywordsFromUI();
+      scoutCfg.bonusKeywords.push({ name: '', aliases: [], weight: 1 });
+      renderScout();
+    });
+    // 删除按钮用事件委托（因为行是动态的）
+    $('#kw_list', bodyEl)?.addEventListener('click', (e) => {
+      const btn = e.target.closest('.kw-del');
+      if (!btn) return;
+      scoutCfg.bonusKeywords = collectBonusKeywordsFromUI();
+      const idx = Number(btn.dataset.idx);
+      scoutCfg.bonusKeywords.splice(idx, 1);
+      renderScout();
+    });
+  }
+
   function renderScout() {
     const isRunning = scoutProgress.running;
     const isPaused = scoutProgress.paused;
@@ -3609,12 +3717,8 @@
     const target = scoutCfg.targetCount;
 
     bodyEl.innerHTML =
-      '<fieldset><legend>岗位筛选与收藏（第一部分）</legend>' +
-      '<div class="hint">在 BOSS 直聘实习列表页自动筛选并收藏符合要求的岗位。筛选口径：时长≤' + scoutCfg.maxMonths + '月、日薪中值≥' + scoutCfg.minDailySalary + '、出勤≤' + scoutCfg.maxDaysPerWeek + '天/周、招聘者活跃、简历匹配、无硬伤。</div>' +
-
-      // 目标城市配置
-      '<label>目标城市（每行一个：城市名,城市代码）</label>' +
-      '<textarea id="s_cities" rows="4" placeholder="北京,101010100&#10;上海,101020100">' + esc(scoutCfg.cities.map((c) => c.name + ',' + c.code).join('\n')) + '</textarea>' +
+      '<fieldset><legend>岗位筛选与收藏</legend>' +
+      '<div class="hint">在 BOSS 直聘实习列表页自动筛选并收藏符合要求的岗位。筛选口径：时长≤' + scoutCfg.maxMonths + '月、日薪中值≥' + scoutCfg.minDailySalary + '、出勤≤' + scoutCfg.maxDaysPerWeek + '天/周、招聘者活跃、无硬伤。</div>' +
 
       // 筛选参数
       '<div class="row">' +
@@ -3630,18 +3734,23 @@
 
       // HR 活跃度筛选
       '<label>HR 活跃度筛选（勾选的状态才通过）</label>' +
-      '<div class="row" style="flex-wrap:wrap;gap:8px">' +
+      '<div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 12px">' +
       ['在线', '刚刚活跃', '今日活跃', '昨日活跃', '3日内活跃', '本周活跃'].map((s) =>
-        '<label style="display:inline-flex;align-items:center;gap:4px;font-size:12px"><input type="checkbox" class="s_hr_status" value="' + s + '"' +
+        '<label style="display:flex;align-items:center;gap:4px;font-size:12px;white-space:nowrap"><input type="checkbox" class="s_hr_status" value="' + s + '" style="flex:0 0 14px"' +
         ((scoutCfg.hrActiveStatus || []).includes(s) ? ' checked' : '') + '> ' + s + '</label>'
       ).join('') +
       '</div>' +
+
+      // 硬伤关键词
+      renderHardInjuriesHTML() +
+
+      // 关键词加分
+      renderBonusKeywordsHTML() +
 
       // 控制按钮
       '<div class="btns">' +
       '<button class="act pri" id="s_save"' + (isRunning ? ' disabled' : '') + '>保存配置</button>' +
       '<button class="act pri" id="s_start"' + (isRunning ? ' disabled' : '') + '>开始筛选当前页</button>' +
-      '<button class="act" id="s_startall"' + (isRunning ? ' disabled' : '') + '>批量筛选所有城市</button>' +
       (isRunning ? '<button class="act" id="s_pause_resume">' + (scoutProgress.paused ? '继续' : '暂停') + '</button>' : '') +
       (isRunning ? '<button class="act" id="s_stop">停止</button>' : '') +
       '</div>' +
@@ -3672,14 +3781,19 @@
       '</fieldset>';
 
     // 绑定事件
+    bindHardInjuriesEvents();
+    bindBonusKeywordsEvents();
+
+    // 折叠/展开事件
+    $$('.collapsible-fieldset .fieldset-legend-toggle', bodyEl).forEach((legend) => {
+      legend.addEventListener('click', (e) => {
+        e.preventDefault();
+        const fieldset = legend.closest('.collapsible-fieldset');
+        if (fieldset) fieldset.classList.toggle('collapsed');
+      });
+    });
+
     $('#s_save', bodyEl)?.addEventListener('click', () => {
-      // 解析城市
-      const lines = ($('#s_cities', bodyEl).value || '').split('\n').map((l) => l.trim()).filter(Boolean);
-      const cities = lines.map((l) => {
-        const parts = l.split(',');
-        return { name: (parts[0] || '').trim(), code: (parts[1] || '').trim() };
-      }).filter((c) => c.name && c.code);
-      scoutCfg.cities = cities.length ? cities : SCOUT_DEFAULTS.cities;
       scoutCfg.targetCount = Math.max(1, Number($('#s_target', bodyEl).value) || 20);
       scoutCfg.maxMonths = Math.max(1, Number($('#s_months', bodyEl).value) || 3);
       scoutCfg.minDailySalary = Math.max(0, Number($('#s_salary', bodyEl).value) || 200);
@@ -3689,6 +3803,15 @@
       // 保存 HR 活跃度筛选
       const hrStatusCheckboxes = $$('.s_hr_status', bodyEl);
       scoutCfg.hrActiveStatus = hrStatusCheckboxes.filter((cb) => cb.checked).map((cb) => cb.value);
+      // 保存硬伤关键词
+      scoutCfg.hardInjuries = collectHardInjuriesFromUI();
+      const injuryEnabledCb = $('#s_injury_enabled', bodyEl);
+      scoutCfg.hardInjuriesEnabled = injuryEnabledCb ? injuryEnabledCb.checked : true;
+      // 保存关键词加分配置
+      scoutCfg.bonusKeywords = collectBonusKeywordsFromUI();
+      scoutCfg.bonusThreshold = Math.max(0, Number($('#s_bonus_threshold', bodyEl).value) || 0);
+      const bonusEnabledCb = $('#s_bonus_enabled', bodyEl);
+      scoutCfg.bonusKeywordsEnabled = bonusEnabledCb ? bonusEnabledCb.checked : true;
       saveScoutCfg();
       log('✓ 筛选配置已保存');
       renderScout();
@@ -3714,25 +3837,6 @@
       saveScoutProgress();
       if (result.error) log('✗ 错误: ' + result.error);
       else log('▶ 筛选结束：本轮收藏 ' + result.favorited.length + ' 个，跳过 ' + result.skipped.length + ' 个');
-      renderScout();
-    });
-
-    $('#s_startall', bodyEl)?.addEventListener('click', async () => {
-      if (scoutProgress.running) { log('· 筛选已在运行'); return; }
-      if (!confirm('将按配置依次处理 ' + scoutCfg.cities.length + ' 个城市，目标收藏 ' + scoutCfg.targetCount + ' 个。期间会跳转页面，确定开始？')) return;
-      scoutProgress.running = true;
-      scoutProgress.paused = false;
-      scoutProgress.currentIndex = 0;
-      scoutProgress.currentJobId = '';
-      saveScoutProgress();
-      renderScout(); // 立即显示暂停/停止按钮
-      log('▶ 开始批量筛选所有城市...');
-      await runScoutAllCities();
-      scoutProgress.running = false;
-      scoutProgress.paused = false;
-      scoutProgress.currentIndex = 0;
-      scoutProgress.currentJobId = '';
-      saveScoutProgress();
       renderScout();
     });
 
