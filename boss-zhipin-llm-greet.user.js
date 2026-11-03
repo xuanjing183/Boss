@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 · 岗位筛选与打招呼助手
 // @namespace    qoder.boss.assistant
-// @version      0.7.1
+// @version      0.7.2
 // @description  两部分功能：(1) 按薪资/时长/出勤/招聘者活跃度/简历匹配度自动筛选并收藏岗位；(2) 读取收藏的岗位，连同本地简历一起交给大模型生成个性化打招呼语，再半自动/自动发送给 HR
 // @match        https://www.zhipin.com/*
 // @match        https://*.zhipin.com/*
