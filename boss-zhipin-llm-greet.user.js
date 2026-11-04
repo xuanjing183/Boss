@@ -1,10 +1,9 @@
 // ==UserScript==
 // @name         BOSS直聘 · 岗位筛选与打招呼助手
 // @namespace    qoder.boss.assistant
-// @version      0.7.2
-// @description  两部分功能：(1) 按薪资/时长/出勤/招聘者活跃度/简历匹配度自动筛选并收藏岗位；(2) 读取收藏的岗位，连同本地简历一起交给大模型生成个性化打招呼语，再半自动/自动发送给 HR
-// @match        https://www.zhipin.com/*
-// @match        https://*.zhipin.com/*
+// @version      0.8.9
+// @description  两部分功能：(1) 按薪资/时长/出勤/招聘者活跃度/简历匹配度自动筛选并收藏岗位；(2) 读取收藏的岗位，连同本地简历一起交给大模型（API 或网页版）生成个性化打招呼语，再半自动/自动发送给 HR
+// @match        *://*/*
 // @run-at       document-idle
 // @noframes
 // @grant        GM_xmlhttpRequest
@@ -14,12 +13,14 @@
 // @grant        GM_listValues
 // @grant        GM_registerMenuCommand
 // @grant        GM_openInTab
+// @grant        unsafeWindow
 // @connect      *
-// @require      https://registry.npmmirror.com/pdfjs-dist/3.11.174/files/legacy/build/pdf.min.js
 // ==/UserScript==
 
-/* pdf.js 镜像说明：用 npmmirror（阿里）是因为 jsdelivr / unpkg 在大陆经常超时（已在本机验证）。
- * 若这个地址也不通，把上面 @require 和「设置」里的 pdfWorkerSrc 一起换成：
+/* pdf.js 改为按需加载（v0.8.0）：@match 全站匹配后，@require 会在每个页面解析约 377KB，
+ * 代价太大。现在只在「简历 → 选择 PDF」时用 GM_xmlhttpRequest 取源码再执行。
+ * 镜像优先级（ensurePdfJs 里依次尝试）：
+ *   https://registry.npmmirror.com/pdfjs-dist/3.11.174/files/legacy/build/pdf.min.js
  *   https://cdn.bootcdn.net/ajax/libs/pdf.js/3.11.174/pdf.min.js
  *   https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
  *   https://cdn.staticfile.net/pdf.js/3.11.174/pdf.min.js
@@ -29,25 +30,26 @@
  * 安装：Edge/Chrome 装 Tampermonkey -> 新建脚本 -> 粘贴本文件 -> Ctrl+S
  * 注意：IE 无法运行（油猴没有 IE 版本，BOSS 直聘网页版也不支持 IE），必须用 Edge 或 Chrome。
  *
- * v0.7.0 两部分功能：
+ * v0.8.0 两部分功能：
  *   第一部分【筛选】：在「筛选」tab 配置口径/目标数，打开 BOSS 实习列表页后点「开始筛选当前页」，
  *                    脚本自动按日薪/时长/出勤/招聘者活跃度/简历匹配度过滤，
  *                    合格的点收藏，不合格的跳过并记录原因。
  *   第二部分【打招呼】：在「岗位」tab 抓取收藏的岗位 → 「队列」tab 生成招呼语 → 发送。
+ *                    生成方式二选一：API（OpenAI 兼容接口）或网页（脚本操作你已登录的网页版 LLM）。
  *
  * 首次使用顺序：
- *   1) 「设置」tab 填 API Key / Model
+ *   1) API 模式：「设置」tab 填 API Key / Model；网页模式：「队列」tab 填 LLM 网址
  *   2) 「简历」tab 选 PDF 或粘文本
  *   3) 「筛选」tab 配置口径，开始筛选并收藏
  *   4) 收藏完成后，去「岗位」tab 抓当前页（BOSS 收藏列表页）
- *   5) 勾上要处理的岗位 → 「队列」tab 生成 → 发送
+ *   5) 勾上要处理的岗位 → 「队列」tab 选生成方式 → 生成 → 发送
  */
 (function () {
   'use strict';
 
   // 版本号跟上面 @version 保持一致：面板标题和启动日志都会打出来，
   // 方便确认「油猴里跑的到底是哪一版」（改完脚本忘了替换是最常见的坑）。
-  const VER = '0.7.1';
+  const VER = '0.8.9';
 
   /* ---------------------------------------------------------------- 配置存储 */
 
@@ -63,6 +65,10 @@
     logbuf: 'bgLogBuf',     // 日志在油猴存储里的那份副本（整页跳转不会把历史留在内存里）
     exec: 'bgExec',         // 面板递给「生成器」标签页的交接单（跑哪几条、被谁认领了）
     execLog: 'bgLogExec',   // 生成器那一页自己的日志副本（和面板那份分开，两边不互相盖）
+    // v0.8.0 网页版 LLM 调用
+    webReq: 'webReq',       // 网页执行方要处理的请求队列
+    webState: 'webState',   // 网页执行方的心跳 / 阶段 / 当前对话
+    webLog: 'bgLogWeb',     // 网页执行方自己的日志副本（不覆盖 BOSS 面板那份）
     // v0.7.0 筛选功能新增
     scoutCfg: 'scoutCfg',   // 筛选配置（口径、目标数）
     scoutProgress: 'scoutProgress', // 筛选进度（已收藏、已跳过、当前状态）
@@ -96,6 +102,45 @@
   const execToken = execMarkToken();
   // 标记在地址上就按生成器记账（哪怕后来认领失败）：日志写到哪一份，不能等认领结果出来才定。
   let isExec = !!execToken;
+
+  /* ---------------- v0.8.0：这一页是不是脚本开出来的「网页版 LLM 执行器」 ----------------
+   * 与生成器标签页同一套身份手法：URL 上的 #bgWeb=<token> 说明「是脚本开的」。
+   * 额外两层保险：
+   *   1) sessionStorage 记住 token —— 重建会话时整页跳转，hash 会丢，tab 身份不能丢；
+   *   2) origin 必须与 cfg.webUrl 同源 —— 别人随便在地址后加个 #bgWeb= 也不会被当成执行方。
+   */
+  const WEB_MARK = 'bgWeb=';
+  const WEB_TITLE = '招呼语网页执行器 · 请别关这个标签页';
+  const WEB_TOKEN_KEY = 'bgWebToken';
+  function webMarkToken() {
+    const re = /bgWeb=([a-z0-9]+)/;
+    const m = re.exec(String(location.hash || ''));
+    if (m) return m[1];
+    try {
+      const n = (performance.getEntriesByType('navigation') || [])[0];
+      const m2 = re.exec(String((n && n.name) || ''));
+      return m2 ? m2[1] : '';
+    } catch (e) { return ''; }
+  }
+  function sessionWebToken() {
+    try { return sessionStorage.getItem(WEB_TOKEN_KEY) || ''; } catch (e) { return ''; }
+  }
+  function rememberWebToken(t) {
+    try { sessionStorage.setItem(WEB_TOKEN_KEY, t); } catch (e) { /* 忽略 */ }
+  }
+  function webOriginOk() {
+    try { return new URL(cfg.webUrl).origin === location.origin; } catch (e) { return false; }
+  }
+  function isZhipinHost() {
+    return /(^|\.)zhipin\.com$/i.test(location.hostname);
+  }
+  // 离线测试页（file:// 或本地 http）没有 zhipin 域名，但要跑完整的 UI 冒烟；
+  // 只认两个由测试桩显式挂上的标记，真实站点不会命中。
+  const TEST_MODE = (() => {
+    try { return !!(window.__bossTestMode || window.__store); } catch (e) { return false; }
+  })();
+  const webToken = webMarkToken() || sessionWebToken();
+  let isWebWorker = false;   // 等 cfg 加载后再确认同源，见 boot()
 
   const DEFAULT_SYSTEM_PROMPT = [
     '你是帮求职者写 BOSS 直聘打招呼语的助手。',
@@ -137,6 +182,14 @@
     autoFetchDetail: true,    // 抓完列表自动开后台标签进详情页抓 JD（没 JD 的岗位不会生成招呼语）
     autoResume: true,         // 整页跳转把批量打断后，新页面自动接着跑上一轮剩下的岗位
     bgExecutor: true,         // 批量交给脚本自己开的后台「生成器」标签页跑：你在 BOSS 里怎么跳都不打断生成
+    // v0.8.0 网页版 LLM 调用
+    genMode: 'api',           // 'api' = 模型接口；'web' = 操作网页版 LLM 标签页
+    webUrl: 'https://chatgpt.com/',   // 网页版 LLM 地址（建议填项目页/新对话页，别填 /c/ 具体会话）
+    webParts: { system: true, user: true, resume: true, job: true },  // 拼接哪几个元素
+    webTimeoutMs: 180000,     // 单条超时（含排队与等待回复）
+    webAutoOpen: true,        // 网页标签不在线时自动打开
+    webConcurrency: 3,        // v0.9.0：并行网页数（同时打开的 LLM 标签数，1=串行，建议 2-5）
+    webSel: { input: '', send: '', assistant: '', stop: '', canvas: '' },  // 高级：自定义选择器
     pdfWorkerSrc: 'https://registry.npmmirror.com/pdfjs-dist/3.11.174/files/legacy/build/pdf.worker.min.js',
     pdfTimeoutMs: 25000       // 单种 worker 方案的最长耗时，超时自动换下一条路（避免静默卡死）
   };
@@ -147,11 +200,11 @@
    * 字体将这些字符渲染为数字字形。
    * 解决方案：解码 PUA 字符为真实数字。
    */
-  
+
   // PUA 字符到数字的映射（基于观察：U+E0B0=0, U+E0B1=1, ..., U+E0B9=9）
   // 注意：实际编码范围可能不同，需要动态检测
   const PUA_TO_DIGIT = {};
-  
+
   // 初始化映射（覆盖常见 PUA 数字范围）
   for (let i = 0; i <= 9; i++) {
     // 尝试多个可能的范围
@@ -164,7 +217,7 @@
   // 解码 PUA 字符为真实数字
   function decodePUASalary(text) {
     if (!text) return text;
-    
+
     // 调试：记录 PUA 字符的实际编码
     const puaChars = text.match(/[\uE000-\uE0FF]/g);
     if (puaChars && puaChars.length > 0) {
@@ -176,7 +229,7 @@
       }).join(', ');
       log('[SalaryAPI] PUA codes: ' + codeInfo);
     }
-    
+
     // 替换所有 PUA 字符（U+E000-U+E0FF）
     // 映射规律：实际数字 = (last_hex_digit - 1 + 10) % 10
     return text.replace(/[\uE000-\uE0FF]/g, (ch) => {
@@ -237,8 +290,10 @@
   }
 
   // 拦截 fetch 请求（使用 unsafeWindow 访问页面的真实 fetch）
-  const originalFetch = unsafeWindow.fetch;
-  unsafeWindow.fetch = function(...args) {
+  // 非油猴环境（离线冒烟页、某些管理器不给 unsafeWindow）退化成 window，不能让它把整个脚本炸掉。
+  const pageWin = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+  const originalFetch = pageWin.fetch;
+  pageWin.fetch = function(...args) {
     const url = String(args[0] || '');
     return originalFetch.apply(this, args).then((response) => {
       if (url.includes('zhipin.com') && (url.includes('joblist') || url.includes('job/detail'))) {
@@ -252,13 +307,13 @@
   };
 
   // 拦截 XMLHttpRequest（使用 unsafeWindow 访问页面的真实 XHR）
-  const originalXHROpen = unsafeWindow.XMLHttpRequest.prototype.open;
-  const originalXHRSend = unsafeWindow.XMLHttpRequest.prototype.send;
-  unsafeWindow.XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+  const originalXHROpen = pageWin.XMLHttpRequest.prototype.open;
+  const originalXHRSend = pageWin.XMLHttpRequest.prototype.send;
+  pageWin.XMLHttpRequest.prototype.open = function(method, url, ...rest) {
     this._url = String(url || '');
     return originalXHROpen.apply(this, [method, url, ...rest]);
   };
-  unsafeWindow.XMLHttpRequest.prototype.send = function(...args) {
+  pageWin.XMLHttpRequest.prototype.send = function(...args) {
     this.addEventListener('load', function() {
       if (this._url && this._url.includes('zhipin.com') &&
           (this._url.includes('joblist') || this._url.includes('job/detail'))) {
@@ -468,12 +523,12 @@
   // 从详情面板读取招聘者状态
   function readRecruiterStatusFromDetail(detailPanel) {
     const allStatuses = ['在线', '刚刚活跃', '今日活跃', '昨日活跃', '3日内活跃', '本周活跃'];
-    
+
     // 策略1：尝试定位 HR 信息条（岗位介绍下方、公司信息上方的区域）
     // BOSS直聘的HR信息通常在特定的容器中
     const hrInfoSelectors = [
       '.recruiter-info',
-      '.hr-info', 
+      '.hr-info',
       '.boss-info',
       '.job-boss',
       '.recruiter',
@@ -483,13 +538,13 @@
       '[class*="recruiter"]',
       '[class*="boss"]'
     ];
-    
+
     for (const selector of hrInfoSelectors) {
       const hrElement = detailPanel ? detailPanel.querySelector(selector) : document.querySelector(selector);
       if (hrElement) {
         const hrText = (hrElement.innerText || '').replace(/\s+/g, ' ').trim();
         log('[HR状态] 找到HR信息条 (' + selector + '): ' + hrText.substring(0, 200));
-        
+
         for (const status of allStatuses) {
           if (hrText.includes(status)) {
             log('[HR状态] 从HR信息条匹配到: ' + status);
@@ -498,12 +553,12 @@
         }
       }
     }
-    
+
     // 策略2：在整个详情面板中搜索
     if (detailPanel) {
       const panelText = (detailPanel.innerText || '').replace(/\s+/g, ' ').trim();
       log('[HR状态] 详情面板文本片段: ' + panelText.substring(0, 500));
-      
+
       for (const status of allStatuses) {
         if (panelText.includes(status)) {
           log('[HR状态] 从详情面板匹配到: ' + status);
@@ -511,29 +566,29 @@
         }
       }
     }
-    
+
     // 策略3：在整个页面中搜索（但要排除列表页的干扰，只搜索右侧详情区域）
     log('[HR状态] 尝试在页面右侧区域搜索...');
-    const rightPanel = document.querySelector('.job-detail-wrap') || 
+    const rightPanel = document.querySelector('.job-detail-wrap') ||
                        document.querySelector('.right-panel') ||
                        document.querySelector('.side-panel') ||
                        document.body;
     const rightText = (rightPanel.innerText || '').replace(/\s+/g, ' ').trim();
-    
+
     for (const status of allStatuses) {
       if (rightText.includes(status)) {
         log('[HR状态] 从右侧面板匹配到: ' + status);
         return status;
       }
     }
-    
+
     // 策略4：搜索包含状态关键词的特定元素（如span、div、badge等）
     log('[HR状态] 尝试搜索状态标签元素...');
     const statusElements = $$('span, div, em, i, label').filter((e) => {
       const t = (e.innerText || '').trim();
       return allStatuses.some((s) => t === s || t.includes(s));
     });
-    
+
     if (statusElements.length > 0) {
       // 取第一个匹配的元素，优先取在详情面板内的
       const inDetail = statusElements.find((e) => detailPanel && detailPanel.contains(e));
@@ -542,7 +597,7 @@
       log('[HR状态] 从标签元素匹配到: ' + statusText);
       return statusText;
     }
-    
+
     log('[HR状态] 未匹配到任何状态');
     return null;
   }
@@ -551,51 +606,50 @@
   // 返回 { ok, why, recruiterStatus }
   async function clickFavoriteButton(cardElement) {
     if (!cardElement) return { ok: false, why: '没有卡片元素', recruiterStatus: null };
-    
+
     // 检查是否已暂停/停止
     if (!scoutProgress.running || scoutProgress.paused) {
       return { ok: false, why: '筛选已暂停/停止', recruiterStatus: null };
     }
-    
+
     // 1. 找到岗位链接并点击，打开右侧详情面板
-    const jobLink = cardElement.querySelector('a[href*="job_detail"]') || 
+    const jobLink = cardElement.querySelector('a[href*="job_detail"]') ||
                     cardElement.querySelector('a[href*="job/"]') ||
                     cardElement.closest('a[href*="job"]');
-    
+
     if (!jobLink) {
       log('[收藏] 未找到岗位链接');
       return { ok: false, why: '没找到岗位链接', recruiterStatus: null };
     }
-    
+
     log('[收藏] 点击岗位链接打开详情面板');
     jobLink.click();
-    
+
     // 2. 等待详情面板加载（可中断）- 增加等待时间到3秒
     await sleepInterruptible(3000);
     if (!scoutProgress.running || scoutProgress.paused) {
       return { ok: false, why: '筛选已暂停/停止', recruiterStatus: null };
     }
-    
+
     // 3. 在详情面板区域查找收藏按钮
     // BOSS直聘的详情面板通常在右侧，尝试更多选择器
-    const detailPanel = document.querySelector('.job-detail-wrap') || 
+    const detailPanel = document.querySelector('.job-detail-wrap') ||
                        document.querySelector('.job-detail') ||
                        document.querySelector('.detail-panel') ||
                        document.querySelector('.job-card-detail') ||
                        document.querySelector('[class*="detail"]') ||
                        document.querySelector('.right-panel') ||
                        document.querySelector('.side-panel');
-    
+
     if (!detailPanel) {
       log('[收藏] 未找到详情面板容器，将在全页面搜索HR状态');
     } else {
       log('[收藏] 找到详情面板容器');
     }
-    
-    // 3.5 提取详情面板完整 JD 文本
-    const detailText = detailPanel
-      ? (detailPanel.innerText || '').replace(/\s+/g, ' ').trim()
-      : '';
+
+    // 3.5 提取详情面板完整 JD 文本（v0.8.2：先切掉招聘者/公司信息等噪声）
+    const rawDetail = detailPanel ? (detailPanel.innerText || '') : '';
+    const detailText = cleanDetailText(rawDetail).replace(/\s+/g, ' ').trim();
     log('[收藏] 详情面板文本长度: ' + detailText.length);
     if (detailText) log('[收藏] 详情面板文本片段: ' + detailText.substring(0, 300));
 
@@ -641,7 +695,7 @@
         return visible(e) && !isUploadish(e) && (t === '收藏' || t === '感兴趣');
       });
     }
-    
+
     if (!btns.length) {
       // 扩大搜索范围：在整个页面查找
       log('[收藏] 详情面板内未找到收藏按钮，扩大搜索范围');
@@ -655,17 +709,17 @@
       }
       btns = allBtns;
     }
-    
+
     // 5. 取最里层的元素（避免点到外层容器）
     const btn = btns.filter((e) => !btns.some((o) => o !== e && e.contains(o)))[0] || btns[0];
     const label = (btn.innerText || '').trim();
-    
+
     log('[收藏] 找到按钮: ' + label);
-    
+
     if (label.includes('取消')) {
       return { ok: false, why: '已经收藏过了（按钮文案是「' + label + '」）', recruiterStatus };
     }
-    
+
     // 6. 点击收藏按钮
     try {
       btn.click();
@@ -673,15 +727,15 @@
       if (!scoutProgress.running || scoutProgress.paused) {
         return { ok: false, why: '筛选已暂停/停止', recruiterStatus };
       }
-      
+
       // 7. 校验：按钮文案应该变成"取消收藏"或"已收藏"
       const newLabel = (btn.innerText || '').trim();
       log('[收藏] 点击后按钮文案: ' + newLabel);
-      
+
       if (newLabel.includes('取消') || newLabel.includes('已')) {
         return { ok: true, why: '收藏成功', recruiterStatus };
       }
-      
+
       // 再次检查是否有其他反馈
       await sleepInterruptible(500);
       if (!scoutProgress.running || scoutProgress.paused) {
@@ -691,11 +745,11 @@
         const t = (e.innerText || '').trim();
         return t.includes('取消收藏') || t.includes('已收藏');
       }) : false;
-      
+
       if (finalCheck) {
         return { ok: true, why: '收藏成功（通过二次检查确认）', recruiterStatus };
       }
-      
+
       return { ok: false, why: '点击后按钮文案未变化（' + newLabel + '），可能没成功', recruiterStatus };
     } catch (e) {
       log('[收藏] 点击失败: ' + e.message);
@@ -947,6 +1001,14 @@
     m.model = cleanCfgStr(m.model) || cfg.model;
     m._label = '并行模型' + (i + 1);   // 内部标签，日志/探针用
   });
+  // v0.8.0 网页版调用：把可能被手动编辑成半截的对象补齐
+  cfg.webParts = Object.assign({}, DEFAULTS.webParts, cfg.webParts || {});
+  cfg.webSel = Object.assign({}, DEFAULTS.webSel, cfg.webSel || {});
+  // 只在「完全没设置」时填默认值；已有地址即使格式可疑也不悄悄改掉，
+  // 否则会从项目页退回 chatgpt.com 首页，项目指令直接失效。
+  if (!cfg.webUrl) cfg.webUrl = DEFAULTS.webUrl;
+  cfg.webTimeoutMs = Math.max(30000, Number(cfg.webTimeoutMs) || DEFAULTS.webTimeoutMs);
+  if (cfg.genMode !== 'web') cfg.genMode = 'api';
 
   function load(key, fallback) {
     try {
@@ -1136,7 +1198,7 @@
   /* ---------------------------------------------------------------- 小工具 */
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  
+
   // 可中断的睡眠：每 100ms 检查一次暂停/停止标志
   const sleepInterruptible = (ms) => new Promise((resolve) => {
     const start = Date.now();
@@ -1153,7 +1215,7 @@
     };
     check();
   });
-  
+
   const rnd = (a, b) => Math.floor(a + Math.random() * (b - a));
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   const clamp = (s, n) => { s = String(s || ''); return s.length > n ? s.slice(0, n) : s; };
@@ -1166,6 +1228,13 @@
   // 新页面起来先把它捞回去 —— 存储只留最近 200 行，别把 GM 存储撑大。
   let logSavedAt = 0;
   let logFlush = 0;
+  // 三类页面各写各的日志：面板 / 生成器 / 网页执行器。以前只有前两类，
+  // v0.8.0 加了网页执行器（跑在 LLM 站点上），不能再往面板那份里写，否则会把 BOSS 页的进度盖掉。
+  function logKeyForPage() {
+    if (isExec) return K.execLog;
+    const web = !TEST_MODE && (isWebWorker || (!!webToken && !isZhipinHost() && webOriginOk()));
+    return web ? K.webLog : K.logbuf;
+  }
   function saveLog(force) {
     const now = Date.now();
     if (!force && now - logSavedAt < 1200) {
@@ -1174,13 +1243,13 @@
       return;
     }
     logSavedAt = now;
-    // 生成器那一页写的日志单独存一份：两边各写各的，谁都不会把对方那 200 行盖掉
+    // 生成器/网页执行器那一页写的日志单独存一份：各写各的，谁都不会把对方那 200 行盖掉
     // （旧写法是两边共用一个键、整块盖，结果是面板刷新生成的时候正好把生成器的进度抹了）。
-    try { GM_setValue(isExec ? K.execLog : K.logbuf, logBuf.slice(-200)); } catch (e) {}
+    try { GM_setValue(logKeyForPage(), logBuf.slice(-200)); } catch (e) {}
   }
   function restoreLog() {
     let prev = [];
-    try { prev = GM_getValue(isExec ? K.execLog : K.logbuf, []) || []; } catch (e) { prev = []; }
+    try { prev = GM_getValue(logKeyForPage(), []) || []; } catch (e) { prev = []; }
     if (!Array.isArray(prev) || !prev.length) return 0;
     for (let i = Math.max(0, prev.length - 200); i < prev.length; i++) logBuf.push(prev[i]);
     return prev.length;
@@ -1249,6 +1318,41 @@
 
   /* ---------------------------------------------------------------- 简历 */
 
+  // v0.8.0：pdf.js 不再用 @require（全站匹配会让每个页面都解析 377KB）。
+  // 只在这一刻按需拉取一次，拉到就在油猴沙箱里执行，挂出全局 pdfjsLib。
+  const PDF_JS_URLS = [
+    'https://registry.npmmirror.com/pdfjs-dist/3.11.174/files/legacy/build/pdf.min.js',
+    'https://cdn.bootcdn.net/ajax/libs/pdf.js/3.11.174/pdf.min.js',
+    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
+    'https://cdn.staticfile.net/pdf.js/3.11.174/pdf.min.js'
+  ];
+  let pdfJsLoading = null;
+  async function ensurePdfJs() {
+    if (typeof pdfjsLib !== 'undefined') return true;
+    if (pdfJsLoading) return pdfJsLoading;
+    pdfJsLoading = (async () => {
+      for (const url of PDF_JS_URLS) {
+        try {
+          log('正在加载 PDF 组件：' + String(url).replace(/^https?:\/\//, '').slice(0, 52) + '…');
+          const src = await gmText(url);
+          if (!src || src.length < 50000) throw new Error('返回内容过短（' + (src || '').length + ' 字节）');
+          // 间接 eval 在沙箱全局执行；pdf.min.js 是 UMD，会把 pdfjsLib 挂到当前全局
+          (0, eval)(src);   // eslint-disable-line no-eval
+          if (typeof pdfjsLib !== 'undefined') {
+            log('✓ PDF 组件已加载 v' + (pdfjsLib.version || '?'));
+            return true;
+          }
+          throw new Error('执行后没有挂出 pdfjsLib');
+        } catch (e) {
+          log('· PDF 组件镜像不可用：' + String((e && e.message) || e).slice(0, 90));
+        }
+      }
+      log('✗ PDF 组件加载失败：四个镜像都不通。可把简历另存为 .txt 再选，或直接粘贴文本点「保存文本」。');
+      return false;
+    })();
+    try { return await pdfJsLoading; } finally { pdfJsLoading = null; }
+  }
+
   async function resumeFromFile(file) {
     const name = (file.name || '').toLowerCase();
     log('已选择文件：' + file.name + '（' + Math.round(file.size / 1024) + ' KB）');
@@ -1261,13 +1365,7 @@
       return;
     }
     if (!/\.pdf$/.test(name)) { log('✗ 只支持 .pdf / .txt / .md'); return; }
-    if (typeof pdfjsLib === 'undefined') {
-      log('✗ pdf.js 没加载成功：@require 的资源油猴没下载下来。把下面地址粘到浏览器新标签打开验证是否可达：');
-      log('    https://registry.npmmirror.com/pdfjs-dist/3.11.174/files/legacy/build/pdf.min.js');
-      log('    能下载 = 脚本里 @require 那行没更新，重新粘贴保存脚本即可；不通 = 换文件头注释里列的 bootcdn/cdnjs 镜像。');
-      log('    想立刻继续：简历另存为 .txt 再选一次，或直接粘贴到下面文本框点「保存文本」。');
-      return;
-    }
+    if (!(await ensurePdfJs())) return;
     log('开始解析 PDF，v' + (pdfjsLib.version || '?') + '，worker=' + cfg.pdfWorkerSrc.slice(0, 42) + '…');
     const buf = new Uint8Array(await file.arrayBuffer());
     const text = await pdfToText(buf);
@@ -1456,11 +1554,8 @@
   }
   /* PDF-END */
 
-  function selfCheckPdf() {
-    if (typeof pdfjsLib === 'undefined') {
-      log('✗ pdf.js 未加载（@require 被扩展或网络拦了）→ 请用 .txt 或粘贴文本');
-      return;
-    }
+  async function selfCheckPdf() {
+    if (!(await ensurePdfJs())) return;
     log('pdf.js 已加载 v' + (pdfjsLib.version || '?'));
     log('解析时会按「主线程 fake worker → 同源 blob worker → 远程 worker」依次尝试，每条都会打日志');
     // 三条路线各自的先决条件，自检时就告诉你哪条能走，省得到导入时才发现
@@ -1765,12 +1860,71 @@
     return u;
   }
 
+  /* ---------------- v0.8.2：详情面板只留岗位正文 ----------------
+   * 真实详情页的容器经常把「扫码分享 / 举报 / 招聘者 / 竞争力分析 / BOSS 安全提示 /
+   * 公司介绍 / 工商信息 / 工作地址 / 更多职位 / 页脚导航」一起包进来。这些东西进了提示词
+   * 只会浪费 token、干扰模型。这里按「段落标题」切，不按条数切：
+   *   - 从「职位描述/岗位职责」开始；
+   *   - 到「竞争力分析 / BOSS 安全提示 / 公司介绍 / 工商信息 / 工作地址 / 更多职位 / 页脚」结束；
+   *   - 招聘者信息块（姓名 + 活跃状态 + 人事经理）只在「上一行像姓名、后续几行有人事/HR 头衔」
+   *     时才切，避免把 JD 里单独一行的「在线」误当成招聘者状态。
+   * 岗位职责写 20 条、30 条都原样保留，没有任何条数上限。
+   */
+  const DETAIL_START_RE = /^(职位描述|岗位描述|岗位职责|工作内容|职位详情|工作职责)\s*[:：]?/m;
+  const DETAIL_END_RE = /^(竞争力分析|BOSS\s*安全提示|公司介绍|工商信息|工作地址|更多职位|看过该职位的人还看了|精选职位|页面更新时间.*|举报)$/;
+  const HR_STATUS_LINE_RE = /^(在线|刚刚活跃|今日活跃|昨日活跃|3\s*日内活跃|本周活跃|月内活跃|2\s*周内活跃|4\s*周内活跃|半年前活跃)$/;
+
+  function isHrBlockAt(lines, i) {
+    const prev = String(lines[i - 1] || '').trim();
+    const next = lines.slice(i + 1, i + 6).map((l) => String(l).trim()).join(' ');
+    const prevLooksName = /^[\u4e00-\u9fa5]{2,4}$/.test(prev) || /(先生|女士|小姐)$/.test(prev);
+    const nextHasHrTitle = /(人事|HR|招聘|经理|主管|专员|总监)/i.test(next);
+    return prevLooksName && nextHasHrTitle;
+  }
+
+  function cleanDetailText(raw) {
+    const original = String(raw || '').replace(/\r/g, '').trim();
+    let text = original;
+    // 扫码分享那一块（可能出现在标题前，也可能分散成三行）
+    text = text.replace(/微\s*信\s*\n\s*扫\s*\n?\s*码分享\s*举报/g, '');
+    text = text.replace(/微信扫码分享|扫码分享/g, '');
+    // 从「职位描述/岗位职责」开始，前面全部是标题/薪资/按钮噪声
+    const sm = DETAIL_START_RE.exec(text);
+    if (sm && sm.index > 0) text = text.slice(sm.index);
+    const out = [];
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const t = lines[i].trim();
+      if (!t) { out.push(''); continue; }
+      if (DETAIL_END_RE.test(t)) break;     // 竞争力分析/安全提示/公司介绍……到这儿为止
+      if (HR_STATUS_LINE_RE.test(t) && isHrBlockAt(lines, i)) {
+        // 招聘者信息块：姓名 + 活跃状态 + 公司 + 人事经理
+        while (out.length && !out[out.length - 1].trim()) out.pop();
+        if (out.length) out.pop();          // 上一行是「汤先生」这类姓名，一起切掉
+        break;
+      }
+      if (/^(分享|举报|微信|扫|码分享)$/.test(t)) continue;
+      out.push(t);
+    }
+    let res = out.join('\n').replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+    // 兜底：如果结束标记和正文黏在同一行，再从标记处截一刀
+    const flat = res.replace(/\n/g, '\u0001');
+    const em = /(竞争力分析|BOSS\s*安全提示|公司介绍|工商信息|工作地址|更多职位|看过该职位的人还看了|精选职位|页面更新时间)/.exec(flat);
+    if (em && em.index > 20) res = flat.slice(0, em.index).replace(/\u0001/g, '\n').trim();
+    // 切过头保护：清洗后异常短就退回原文（只压空白），宁可多带噪声也不丢岗位内容
+    if (res.length < 30 && original.length > 120) {
+      res = original.replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+    }
+    return res;
+  }
+
   function scrapeDetail(id) {
     const pick = (sel) => { const e = $(sel); return e ? (e.innerText || '').trim() : ''; };
     const any = (sels) => { for (const s of sels) { const t = pick(s); if (t.length > 12) return t; } return ''; };
     const body = any(['.job-detail', '.job-boss', '.job-primary', '[class*="job-detail"]', '[class*="job-sec"]', '[class*="job-desc"]', 'main', 'article']);
     let text = body || document.body.innerText || '';
-    text = text.replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+    // v0.8.2：只留「职位描述 → 任职要求」这一段，去掉招聘者/公司信息/推荐岗位/页脚
+    text = cleanDetailText(text);
     if (!/\d+\s*[-~]\s*\d+\s*[Kk千万]/.test(text)) {
       const s = (document.body.innerText.match(/[^\n]{0,10}\d+(?:\.\d+)?\s*[-~]\s*\d+(?:\.\d+)?\s*[Kk千万][^\n]{0,10}/) || [])[0];
       if (s) text = s + '\n' + text;
@@ -1977,7 +2131,10 @@
     return parts.filter(Boolean).join('\n');
   }
 
-  async function generateOne(id, modelCfg) {
+  /* --------------------------- 生成前校验 / 提示词 / 落草稿 ---------------------------
+   * v0.8.0 起 API 与网页两种模式共用这三段，避免「一边有校验、一边没有」。
+   */
+  function prepareJob(id) {
     const job = jobs.find((j) => j.id === id);
     if (!job) throw new Error('岗位不存在');
     const resume = getResume();
@@ -1994,14 +2151,47 @@
       err.noJd = true;
       throw err;
     }
-    const userText = cfg.userPrompt
+    return { job, resume };
+  }
+
+  function buildApiUserText(job, resume) {
+    return cfg.userPrompt
       .replace('{{RESUME}}', clamp(resume, Number(cfg.resumeChars)))
       .replace('{{JOB}}', jobForPrompt(job));
-    llmLive++;
-    log('→ [' + (modelCfg._label || '?') + '] 发出模型请求「' + jobTitle(id) + '」（同时在飞 ' + llmLive + ' 条）');
-    let txt;
-    try { txt = await chat(cfg.systemPrompt, userText, modelCfg); }
-    finally { llmLive--; }
+  }
+
+  // 网页模式的提示词：按 4 个勾选拼接。预览与真正发送共用这一个函数，保证逐字一致。
+  // v0.8.4：不再自动追加「请生成一条…」和「只输出打招呼语本身…」——这两句由用户在
+  // LLM 侧（项目指令/自定义指令）统一配置，脚本只负责把勾选的资料原样拼进去。
+  function buildWebPrompt(job, resume) {
+    const p = cfg.webParts || {};
+    const parts = [];
+    const sys = String(cfg.systemPrompt || '').trim();
+    if (p.system && sys) parts.push('【系统指令】\n' + sys);
+
+    const tpl = String(cfg.userPrompt || '');
+    const hasResumePh = /\{\{RESUME\}\}/.test(tpl);
+    const hasJobPh = /\{\{JOB\}\}/.test(tpl);
+    const resumeText = clamp(resume, Number(cfg.resumeChars));
+    const jobText = jobForPrompt(job);
+
+    if (p.user) {
+      let u = tpl
+        .replace(/\{\{RESUME\}\}/g, p.resume ? resumeText : '')
+        .replace(/\{\{JOB\}\}/g, p.job ? jobText : '');
+      u = u.trim();
+      if (u) parts.push(u);
+      // 模板里没有占位符，但用户勾了对应元素 → 补一段，避免“勾了却没发”
+      if (p.resume && !hasResumePh) parts.push('【我的简历】\n' + resumeText);
+      if (p.job && !hasJobPh) parts.push('【目标岗位】\n' + jobText);
+    } else {
+      if (p.resume) parts.push('【我的简历】\n' + resumeText);
+      if (p.job) parts.push('【目标岗位】\n' + jobText);
+    }
+    return parts.filter(Boolean).join('\n\n');
+  }
+
+  function commitDraft(id, txt) {
     drafts[id] = { text: txt, ts: Date.now(), sent: false, fp: draftFp(id) };
     saveDrafts([id]);
     // 上一轮批量可能把这条标成「缺 JD 已跳过」，现在草稿都有了，那个徽章得摘掉，
@@ -2010,7 +2200,826 @@
     stats.generated++;
     saveStats();
     renderQueue();
+  }
+
+  async function generateOne(id, modelCfg) {
+    const { job, resume } = prepareJob(id);
+    const userText = buildApiUserText(job, resume);
+    llmLive++;
+    log('→ [' + (modelCfg._label || '?') + '] 发出模型请求「' + jobTitle(id) + '」（同时在飞 ' + llmLive + ' 条）');
+    let txt;
+    try { txt = await chat(cfg.systemPrompt, userText, modelCfg); }
+    finally { llmLive--; }
+    commitDraft(id, txt);
     return txt;
+  }
+
+  /* ======================================================================
+   * v0.8.0 网页版 LLM 调用
+   * ----------------------------------------------------------------------
+   * 角色：调度方（BOSS 页/生成器）只负责拼提示词、入队、收结果；
+   *       执行方（脚本自己打开的 LLM 标签页）负责填→发→等→提取→写回。
+   * 通信：GM 存储。每个请求单独一个键（webReq:<rid>），避免多标签整块覆盖。
+   * 并发：网页只有一个输入框，所以全局串行，一次一条。
+   * ====================================================================== */
+
+  const WEB_REQ_PREFIX = 'webReq:';
+
+  function saveWebReqItem(req) { save(WEB_REQ_PREFIX + req.rid, req); }
+  function deleteWebReqItem(rid) { try { GM_deleteValue(WEB_REQ_PREFIX + rid); } catch (e) {} }
+  function listWebReqItems() {
+    let keys = [];
+    try { keys = GM_listValues() || []; } catch (e) { keys = []; }
+    return keys
+      .filter((k) => String(k).indexOf(WEB_REQ_PREFIX) === 0)
+      .map((k) => load(k, null))
+      .filter(Boolean);
+  }
+  function cleanupWebReq() {
+    const now = Date.now();
+    listWebReqItems().forEach((r) => {
+      const tooOld = now - Number(r.createdAt || 0) > 20 * 60 * 1000;
+      const stuck = r.status === 'claimed' && now - Number(r.claimedAt || 0) > 10 * 60 * 1000;
+      if (tooOld || stuck || r.status === 'abandoned') deleteWebReqItem(r.rid);
+    });
+  }
+  function saveWebState(patch) {
+    const cur = load(K.webState, {}) || {};
+    const next = Object.assign({}, cur, patch || {});
+    save(K.webState, next);
+    return next;
+  }
+
+  // v0.9.0：并行模式下每个 worker 有独立的状态 key（webState_w0, webState_w1, ...）
+  // 避免多个 executor 标签页互相覆盖心跳和阶段信息。
+  function webWorkerKey(idx) { return K.webState + '_w' + idx; }
+  function loadWebWorkerState(idx) { return load(webWorkerKey(idx), null) || {}; }
+  function saveWebWorkerState(idx, patch) {
+    const cur = loadWebWorkerState(idx);
+    const next = Object.assign({}, cur, patch || {});
+    save(webWorkerKey(idx), next);
+    return next;
+  }
+  // 从 token 解析 worker 索引（token 格式：w{idx}_{random}）
+  function parseWorkerIdx(token) {
+    const m = String(token || '').match(/^w(\d+)_/);
+    return m ? Number(m[1]) : 0;
+  }
+  // Chrome 会在隐藏 5 分钟后把定时器压到 1 分钟一次；持有 Web Lock 是官方列出的豁免条件之一。
+  // 执行器和生成器都跑在后台标签里，两边都要拿一把，否则等待循环、暂停/停止都会变得很迟钝。
+  function holdKeepAlive(name) {
+    try {
+      if (navigator.locks && navigator.locks.request) {
+        navigator.locks.request(name, { mode: 'exclusive' }, () => new Promise(() => {}));
+      }
+    } catch (e) { /* 老浏览器没有 Web Locks，退化成可能被节流 */ }
+  }
+  function webAlive() {
+    // v0.9.0：并行模式下检查所有 worker 槽位，任一在线即算在线
+    const conc = Math.max(1, Math.round(Number(cfg.webConcurrency) || 1));
+    for (let i = 0; i < conc; i++) {
+      const st = loadWebWorkerState(i);
+      if (st.tabToken && Date.now() - Number(st.tick || 0) < 15000) return true;
+    }
+    // 兜底：检查旧版单 worker 状态
+    const st = load(K.webState, {}) || {};
+    return !!st.tabToken && Date.now() - Number(st.tick || 0) < 15000;
+  }
+  function webStatusLabel() {
+    // v0.9.0：并行模式下汇总所有 worker 槽位的状态
+    const conc = Math.max(1, Math.round(Number(cfg.webConcurrency) || 1));
+    const phases = {
+      idle: '空闲', opening: '打开中', filling: '填提示词', sending: '发送中',
+      waiting: '等回复', extracting: '提取中', resetting: '重建会话'
+    };
+    const parts = [];
+    let onlineCount = 0;
+    for (let i = 0; i < conc; i++) {
+      const st = loadWebWorkerState(i);
+      if (!st.tabToken || Date.now() - Number(st.tick || 0) >= 15000) continue;
+      onlineCount++;
+      const ph = phases[st.phase] || st.phase || '在线';
+      parts.push('W' + i + '·' + ph + (st.jobId ? '(' + jobTitle(st.jobId) + ')' : ''));
+    }
+    if (onlineCount === 0) {
+      const st0 = load(K.webState, {}) || {};
+      if (!st0.tabToken) return '未打开';
+      if (Date.now() - Number(st0.tick || 0) >= 15000) return '离线（标签页关了或还没起来）';
+      const ph = phases[st0.phase] || st0.phase || '在线';
+      return '在线 · ' + ph + (st0.jobId ? '（' + jobTitle(st0.jobId) + '）' : '');
+    }
+    return onlineCount + '/' + conc + ' 在线：' + parts.join(' | ');
+  }
+  function webUrlWithToken(token) {
+    try {
+      const u = new URL(cfg.webUrl);
+      u.hash = WEB_MARK + token;
+      return u.href;
+    } catch (e) {
+      return String(cfg.webUrl || '') + '#' + WEB_MARK + token;
+    }
+  }
+  function isConversationUrl(u) {
+    try { return /\/c\//.test(new URL(u).pathname); } catch (e) { return false; }
+  }
+  // v0.8.7：项目 ID 与 slug 不是一回事。
+  // 配置里常见 https://chatgpt.com/g/g-p-<32位hex>/project（没有 slug），
+  // 而发送后的会话是 /g/g-p-<32位hex>-bossjiao-.../c/xxx（带 slug）。
+  // 之前拿整段路径前缀比较，会把正确会话误判成「项目外」。这里只比项目 ID。
+  function projectIdFromPath(pathname) {
+    const m = /^\/g\/(g-[a-z0-9]+-[0-9a-f]{32})/i.exec(String(pathname || ''));
+    return m ? m[1].toLowerCase() : '';
+  }
+  function projectId() {
+    try { return projectIdFromPath(new URL(cfg.webUrl).pathname); } catch (e) { return ''; }
+  }
+  function configIsProject() { return !!projectId(); }
+  function isProjectHome() {
+    const id = projectId();
+    if (!id) return true;   // 非项目网址：不强制
+    try {
+      const p = new URL(location.href).pathname;
+      if (projectIdFromPath(p) !== id) return false;
+      // 项目首页：/g/<id> 或 /g/<id>-slug/project
+      return /\/project\/?$/.test(p) || /^\/g\/[^/]+\/?$/.test(p);
+    } catch (e) { return false; }
+  }
+  function isInProjectContext() {
+    const id = projectId();
+    if (!id) return true;
+    try { return projectIdFromPath(new URL(location.href).pathname) === id; } catch (e) { return false; }
+  }
+  // 回到项目页开新会话。带一个「连续弹走」保护：5 次都停不住就暂时收手，
+  // 免得「项目页 → 被重定向到首页 → 再跳项目页」变成死循环。
+  let webNavigating = false;   // 已经发起「回项目页」的跳转：跳转提交前不许再领下一条
+  function resetToProjectPage(tabId, reason, workerIdx) {
+    const wIdx = Number(workerIdx) || 0;
+    const stateKey = wIdx > 0 ? webWorkerKey(wIdx) : K.webState;
+    const st = load(stateKey, {}) || {};
+    const now = Date.now();
+    const inWindow = now - Number(st.resetAt || 0) < 90000;
+    const count = inWindow ? Number(st.resetCount || 0) : 0;
+    if (count >= 5) {
+      log('✗ 连续 ' + count + ' 次回到项目页都被弹走，暂停 60 秒：检查网址、登录态或项目是否可用');
+      const patch = { tabToken: tabId, tick: now, phase: 'idle', jobId: '', resetCount: 0, resetAt: 0, cooldownUntil: now + 60000 };
+      if (wIdx > 0) saveWebWorkerState(wIdx, patch); else saveWebState(patch);
+      return false;
+    }
+    if (reason) log('· [网页] ' + reason + '，回到项目页…');
+    const patch2 = {
+      tabToken: tabId, tick: now, phase: 'resetting', jobId: '', rounds: 0,
+      resetCount: count + 1, resetAt: now, url: location.href
+    };
+    if (wIdx > 0) saveWebWorkerState(wIdx, patch2); else saveWebState(patch2);
+    webNavigating = true;
+    try { location.href = cfg.webUrl; } catch (e) { webNavigating = false; return false; }
+    return true;
+  }
+
+  /* ----------------------------- 站点适配器 ----------------------------- */
+
+  function pickWebAdapter() {
+    const host = location.hostname;
+    const isChatGPT = /(^|\.)chatgpt\.com$|(^|\.)chat\.openai\.com$/i.test(host);
+    const a = isChatGPT ? {
+      name: 'chatgpt',
+      input: [
+        // 2026-11 新版：composer 里的 ProseMirror（aria-label=询问 ChatGPT）
+        'div.ProseMirror[contenteditable="true"]',
+        '#prompt-textarea', 'textarea[data-id]'
+      ],
+      send: [
+        'button[data-testid="send-button"]',
+        'button[data-testid="composer-submit-button"]',
+        'button[aria-label*="发送"]', 'button[aria-label*="Send"]'
+      ],
+      // 2026-11 新版把 data-message-author-role 整个换掉了：
+      //   轮次容器 div[data-chatgpt-search-unit-key$=":assistant"]
+      //   正文容器 [data-markdown-text-style="assistant-message"]
+      // 正文容器排第一：innerText 最干净，不带「ChatGPT 说：」和操作按钮。
+      assistant: [
+        '[data-markdown-text-style="assistant-message"]',
+        'div[data-chatgpt-search-unit-key$=":assistant"]',
+        '[data-message-author-role="assistant"]'
+      ],
+      stop: ['button[data-testid="stop-button"]', 'button[aria-label*="停止"]', 'button[aria-label*="Stop"]'],
+      canvas: ['[data-testid*="canvas"]', 'div[class*="writing-block"]', '[data-testid*="text-doc"]']
+    } : {
+      name: 'generic',
+      input: ['textarea', 'div[contenteditable="true"]', '[role="textbox"][contenteditable="true"]'],
+      send: [
+        'button[type="submit"]', 'button[aria-label*="发送"]', 'button[aria-label*="Send"]',
+        'button[aria-label*="提交"]', 'button[aria-label*="Submit"]'
+      ],
+      assistant: ['[data-message-author-role="assistant"]', '[class*="assistant"] [class*="message"]'],
+      stop: ['button[aria-label*="停止"]', 'button[aria-label*="Stop"]'],
+      canvas: []
+    };
+    // 用户自定义选择器优先级最高（站点改版时不用等脚本更新）
+    const sel = cfg.webSel || {};
+    ['input', 'send', 'assistant', 'stop', 'canvas'].forEach((k) => {
+      if (sel[k] && String(sel[k]).trim()) a[k] = [String(sel[k]).trim()].concat(a[k]);
+    });
+    return a;
+  }
+
+  function firstVisible(selectors) {
+    for (const sel of selectors || []) {
+      let arr = [];
+      try { arr = $$(sel); } catch (e) { continue; }
+      const hit = arr.find((e) => visible(e) && notMine(e));
+      if (hit) return hit;
+    }
+    return null;
+  }
+  function findWebInput(adapter) {
+    const el = firstVisible(adapter.input);
+    if (!el) return null;
+    const ph = (el.placeholder || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.className || '');
+    if (/搜索|search|手机号|账号|密码|验证/i.test(ph)) return null;
+    return el;
+  }
+  function assistants(adapter) {
+    for (const sel of adapter.assistant) {
+      let arr = [];
+      try { arr = $$(sel).filter((e) => visible(e) && notMine(e)); } catch (e) { continue; }
+      if (arr.length) return arr;
+    }
+    return [];
+  }
+  function countAssistants(adapter) { return assistants(adapter).length; }
+  function lastAssistantNode(adapter) {
+    const arr = assistants(adapter);
+    return arr.length ? arr[arr.length - 1] : null;
+  }
+  function extractCanvasText(adapter) {
+    for (const sel of adapter.canvas || []) {
+      let nodes = [];
+      try { nodes = $$(sel).filter((e) => visible(e) && notMine(e)); } catch (e) { continue; }
+      for (let i = nodes.length - 1; i >= 0; i--) {
+        const n = nodes[i];
+        // 「写作 / Canvas」块自带一份纯文本副本（不含标题、按钮、推荐追问）
+        const rich = n.querySelector('[data-markdown-copy-text]');
+        if (rich) {
+          const rt = String(rich.getAttribute('data-markdown-copy-text') || '').trim();
+          if (rt) return rt;
+        }
+        const inner = n.querySelector('[contenteditable="true"], .markdown, article, pre');
+        const t = String(((inner || n).innerText) || '').trim();
+        if (t) return t;
+      }
+    }
+    return '';
+  }
+  function extractNodeText(node, adapter) {
+    // v0.8.5：优先读「纯文本副本」。ChatGPT 的写作块 innerText 会带上
+    // “写作”“补充与岗位匹配的技术栈”这类界面文字，而 data-markdown-copy-text
+    // 只有正文，最干净。
+    const rich = node.matches && node.matches('[data-markdown-copy-text]')
+      ? node
+      : node.querySelector('[data-markdown-copy-text]');
+    if (rich) {
+      const rt = String(rich.getAttribute('data-markdown-copy-text') || '').trim();
+      if (rt) return rt;
+    }
+    // 新版 ChatGPT 的正文容器；旧版是 .markdown。两个都试一遍，最后才退回整轮 innerText。
+    const inner = node.querySelector('[data-markdown-text-style="assistant-message"]') ||
+      node.querySelector('.markdown');
+    if (inner) return String(inner.innerText || '').trim();
+    return String(node.innerText || '').trim();
+  }
+  function lastAssistantText(adapter) {
+    const node = lastAssistantNode(adapter);
+    let t = node ? extractNodeText(node, adapter) : '';
+    // Canvas / 写作模式：正文可能不在消息气泡里，拿文档级容器兜一下
+    if (t.length < 15) {
+      const cv = extractCanvasText(adapter);
+      if (cv.length > t.length) t = cv;
+    }
+    return t;
+  }
+  function isWebStreaming(adapter) { return !!firstVisible(adapter.stop); }
+  function scrollWebToBottom() {
+    try {
+      $$('main, [class*="scroll"], [class*="conversation"], [class*="thread"], [class*="chat"]').forEach((el) => {
+        if (el.scrollHeight > el.clientHeight + 60) el.scrollTop = el.scrollHeight;
+      });
+      const d = document.scrollingElement || document.documentElement;
+      if (d) d.scrollTop = d.scrollHeight;
+    } catch (e) { /* 忽略 */ }
+  }
+
+  const WEB_UI_LINES = /^(写作|编辑|显示更多|显示较少|复制|复制消息|分享|共享提示|已复制|好的|新聊天|朗读|重新生成回复|评价回复|更多操作|添加到项目来源|ChatGPT 说：|你说：|ChatGPT said:|You said:|ChatGPT|New chat|Edit|Copy|Share|Read aloud|Show more|Show less)$/i;
+  function sanitizeWebReply(raw) {
+    const lines = String(raw || '').replace(/\r/g, '').split('\n');
+    const kept = [];
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t) continue;
+      // 「选择理由 / 推荐理由」后面是模型的解释，不是招呼语，遇到就停
+      if (/^(选择理由|推荐理由|匹配理由|为什么推荐)\s*[:：]?$/.test(t)) break;
+      // 思考耗时、推荐徽章等界面行
+      if (/^(思考了|已思考|思考用时)\s*\d/i.test(t)) continue;
+      if (/^最推荐发送/.test(t)) continue;
+      if (WEB_UI_LINES.test(t)) continue;
+      let s = t
+        .replace(/^#{1,6}\s*/, '')
+        .replace(/^[-*•>]\s+/, '')
+        .replace(/^\d+[.)]\s+/, '')
+        .trim();
+      if (!s || WEB_UI_LINES.test(s)) continue;
+      kept.push(s);
+    }
+    let out = kept.join('\n').replace(/\n{2,}/g, '\n').trim();
+    out = out.replace(/^["“'']+|["”'']+$/g, '').trim();
+    return out;
+  }
+
+  /* ----------------------------- 调度方 ----------------------------- */
+
+  function ensureWebWorker() {
+    // 每条岗位都要回项目页开新会话；如果网址本身是 /c/ 具体会话，就做不到
+    if (isConversationUrl(cfg.webUrl)) {
+      log('✗ 网址是具体会话（/c/…），无法为每条岗位新建会话。请到「队列 → 网页调用」改成项目页/新对话页');
+      return Promise.resolve(false);
+    }
+    if (webAlive()) return Promise.resolve(true);
+    if (!cfg.webAutoOpen) return Promise.resolve(false);
+    return openWebTab(false);
+  }
+
+  async function openWebTab(interactive, workerIdx) {
+    if (!cfg.webUrl) { log('· 先填网页版 LLM 地址'); return false; }
+    if (isConversationUrl(cfg.webUrl)) {
+      log('✗ 网址是具体会话（/c/…），无法为每条岗位新建会话。请改成项目页/新对话页');
+      return false;
+    }
+    if (!configIsProject()) {
+      log('⚠ 当前网址不在 ChatGPT 项目内（不是 /g/…/project），生成时不会带项目指令。确认要用它再继续。');
+    }
+    if (webAlive()) {
+      if (interactive) log('· 网页执行器已在线：' + webStatusLabel());
+      return true;
+    }
+    if (typeof GM_openInTab !== 'function') { log('✗ 这个环境没有 GM_openInTab，打不开网页标签'); return false; }
+    // v0.9.0：token 格式改为 w{workerIdx}_{random}，executor 据此写入对应的 per-worker 状态
+    const idx = Number(workerIdx) || 0;
+    const token = 'w' + idx + '_' + uid() + uid();
+    rememberWebToken(token);
+    if (idx > 0) {
+      saveWebWorkerState(idx, { tabToken: token, tick: 0, phase: 'opening', url: cfg.webUrl });
+    } else {
+      saveWebState({ tabToken: token, tick: 0, phase: 'opening', url: cfg.webUrl });
+    }
+    try { GM_openInTab(webUrlWithToken(token), { active: false, insert: true, setParent: true }); }
+    catch (e) { log('✗ 打开网页标签失败：' + e.message); return false; }
+    log('· 正在打开网页执行器' + (idx > 0 ? ' W' + idx : '') + '：' + String(cfg.webUrl).slice(0, 64) + '…');
+    for (let i = 0; i < 40; i++) {
+      await sleep(500);
+      if (webAlive()) {
+        log('✓ 网页执行器已就绪');
+        return true;
+      }
+    }
+    log('✗ 20 秒内网页执行器没有就绪：检查是否被登录页/验证码挡住，或该站点没有注入油猴脚本');
+    return false;
+  }
+
+  async function waitWebResult(rid, timeoutMs) {
+    const t0 = Date.now();
+    let lastLogAt = Date.now();
+    // v0.9.0：并行模式下不设 closeRequested（多 tab 共享 webState 会误关别的 tab），
+    // executor tab 会在 30s 超时后自动关闭。
+    const isParallel = (Number(cfg.webConcurrency) || 1) > 1;
+    while (Date.now() - t0 < timeoutMs) {
+      await sleep(700);
+      const r = load(WEB_REQ_PREFIX + rid, null);
+      if (!r) return { status: 'error', error: '请求记录丢失' };
+      if (r.status === 'done' || r.status === 'error') {
+        // v0.8.8：串行模式下读取结果后，通知执行器关闭标签页
+        if (!isParallel) {
+          const st = load(K.webState, {}) || {};
+          if (st.tabToken) {
+            saveWebState(Object.assign({}, st, { closeRequested: true, tick: Date.now() }));
+          }
+        }
+        return r;
+      }
+      if (Date.now() - lastLogAt > 15000) {
+        lastLogAt = Date.now();
+        log('· [网页] 还在等「' + (r.title || r.jobId) + '」的回复（已等 ' + Math.round((Date.now() - t0) / 1000) + ' 秒）');
+      }
+    }
+    await sleep(1500);
+    const late = load(WEB_REQ_PREFIX + rid, null);
+    if (late && late.status === 'done' && late.answer) {
+      if (!isParallel) {
+        const st = load(K.webState, {}) || {};
+        if (st.tabToken) saveWebState(Object.assign({}, st, { closeRequested: true, tick: Date.now() }));
+      }
+      return late;
+    }
+    const cur = load(WEB_REQ_PREFIX + rid, null);
+    if (cur) { cur.status = 'abandoned'; cur.error = '等待回复超时'; saveWebReqItem(cur); }
+    return { status: 'error', error: '等待回复超时（' + Math.round(timeoutMs / 1000) + ' 秒）' };
+  }
+
+  async function generateOneWeb(id) {
+    const { job, resume } = prepareJob(id);
+    const prompt = buildWebPrompt(job, resume);
+    if (!prompt.trim()) throw new Error('拼装出来的提示词是空的：到「队列 → 网页调用」至少勾选一项拼接内容');
+    const timeout = Math.max(30000, Number(cfg.webTimeoutMs) || DEFAULTS.webTimeoutMs);
+    let lastErr = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt) log('· [网页] 重试一次「' + jobTitle(id) + '」');
+      const ready = await ensureWebWorker();
+      if (!ready) throw new Error('网页执行器没有起来：检查网页标签是否被登录页/验证码挡住，或到「队列」页点「打开/验证网页标签」');
+      cleanupWebReq();
+      const rid = 'r' + uid() + Date.now().toString(36);
+      saveWebReqItem({ rid, jobId: id, title: jobTitle(id), prompt, status: 'pending', createdAt: Date.now(), attempts: 0 });
+      log('→ [网页] 已交给执行器「' + jobTitle(id) + '」（最多等 ' + Math.round(timeout / 1000) + ' 秒）');
+      const res = await waitWebResult(rid, timeout);
+      if (res.status === 'done' && res.answer) {
+        commitDraft(id, res.answer);
+        return res.answer;
+      }
+      lastErr = new Error(res.error || '网页生成失败');
+      if (!/超时/.test(lastErr.message)) break;   // 只对超时重试；未登录/提取异常重试也没用
+    }
+    throw lastErr || new Error('网页生成失败');
+  }
+
+  // v0.9.0：并行模式下生成单条岗位。与 generateOneWeb 的区别：
+  // 1. 不使用 ensureWebWorker（避免多 worker 抢同一个 tab）
+  // 2. 自己开 tab、写请求、等结果，不调用 waitWebResult（避免 closeRequested 误关别的 tab）
+  // 3. executor tab 完成后 30s 自动关闭，不需要调度方发关闭信号
+  async function generateOneWebParallel(id, workerIdx) {
+    const { job, resume } = prepareJob(id);
+    const prompt = buildWebPrompt(job, resume);
+    if (!prompt.trim()) throw new Error('拼装出来的提示词是空的：到「队列 → 网页调用」至少勾选一项拼接内容');
+    const timeout = Math.max(30000, Number(cfg.webTimeoutMs) || DEFAULTS.webTimeoutMs);
+
+    // 写请求到存储
+    cleanupWebReq();
+    const rid = 'r' + uid() + Date.now().toString(36);
+    saveWebReqItem({ rid, jobId: id, title: jobTitle(id), prompt, status: 'pending', createdAt: Date.now(), attempts: 0 });
+
+    // 打开 executor tab（带 worker 索引 + targetRid，让 tab 只认领这一条）
+    if (typeof GM_openInTab !== 'function') throw new Error('这个环境没有 GM_openInTab，打不开网页标签');
+    const token = 'w' + workerIdx + '_' + uid() + uid();
+    rememberWebToken(token);
+    saveWebWorkerState(workerIdx, { tabToken: token, tick: 0, phase: 'opening', url: cfg.webUrl, jobId: id });
+    // v0.9.0 fix：URL hash 里带上 targetRid，executor tab 据此只认领指定的请求，避免多 tab 抢同一条
+    const tabUrl = webUrlWithToken(token) + '&rid=' + rid;
+    try { GM_openInTab(tabUrl, { active: false, insert: true, setParent: true }); }
+    catch (e) { throw new Error('打开网页标签失败：' + e.message); }
+    log('→ [网页 W' + workerIdx + '] 已交给执行器「' + jobTitle(id) + '」（最多等 ' + Math.round(timeout / 1000) + ' 秒）');
+
+    // 轮询结果（不设 closeRequested，tab 会自行关闭）
+    const t0 = Date.now();
+    let lastLogAt = Date.now();
+    while (Date.now() - t0 < timeout) {
+      await sleep(700);
+      const r = load(WEB_REQ_PREFIX + rid, null);
+      if (!r) return { status: 'error', error: '请求记录丢失' };
+      if (r.status === 'done' || r.status === 'error') {
+        if (r.status === 'done' && r.answer) commitDraft(id, r.answer);
+        return r;
+      }
+      if (Date.now() - lastLogAt > 15000) {
+        lastLogAt = Date.now();
+        log('· [网页 W' + workerIdx + '] 还在等「' + (r.title || r.jobId) + '」的回复（已等 ' + Math.round((Date.now() - t0) / 1000) + ' 秒）');
+      }
+    }
+    // 超时后多等 1.5s 给迟到的结果
+    await sleep(1500);
+    const late = load(WEB_REQ_PREFIX + rid, null);
+    if (late && late.status === 'done' && late.answer) {
+      commitDraft(id, late.answer);
+      return late;
+    }
+    const cur = load(WEB_REQ_PREFIX + rid, null);
+    if (cur) { cur.status = 'abandoned'; cur.error = '等待回复超时'; saveWebReqItem(cur); }
+    return { status: 'error', error: '等待回复超时（' + Math.round(timeout / 1000) + ' 秒）' };
+  }
+
+  /* ----------------------------- 执行方 ----------------------------- */
+
+  function pickWebRequest(token) {
+    const now = Date.now();
+    const list = listWebReqItems().filter((r) => {
+      if (r.status === 'pending') return true;
+      // 认领者失联超过 30 秒 → 允许其它执行方接手（最多抢一次，避免来回弹）
+      return r.status === 'claimed' && now - Number(r.claimedAt || 0) > 30000 && Number(r.attempts || 0) < 2;
+    });
+    list.sort((a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0));
+    const r = list[0];
+    if (!r) return null;
+    const next = Object.assign({}, r, {
+      status: 'claimed', by: token, claimedAt: now, attempts: Number(r.attempts || 0) + 1
+    });
+    saveWebReqItem(next);
+    const back = load(WEB_REQ_PREFIX + r.rid, null);
+    if (!back || back.by !== token || back.status !== 'claimed') return null;
+    return back;
+  }
+
+  // v0.9.0 fix：按 rid 精确认领指定的请求（并行模式下每个 tab 只处理分配给它的那条）
+  function pickWebReqByRid(rid, token) {
+    const r = load(WEB_REQ_PREFIX + rid, null);
+    if (!r) return null;
+    if (r.status !== 'pending') return null;  // 已被别的 tab 认领或已完成
+    const now = Date.now();
+    const next = Object.assign({}, r, {
+      status: 'claimed', by: token, claimedAt: now, attempts: Number(r.attempts || 0) + 1
+    });
+    saveWebReqItem(next);
+    const back = load(WEB_REQ_PREFIX + rid, null);
+    if (!back || back.by !== token || back.status !== 'claimed') return null;
+    return back;
+  }
+
+  function setWebPhase(token, phase, req, workerIdx) {
+    const wIdx = Number(workerIdx) || 0;
+    if (wIdx > 0) {
+      saveWebWorkerState(wIdx, {
+        tabToken: token, tick: Date.now(), phase: phase,
+        jobId: req ? req.jobId : '', url: location.href
+      });
+    } else {
+      saveWebState({
+        tabToken: token, tick: Date.now(), phase: phase,
+        jobId: req ? req.jobId : '', url: location.href
+      });
+    }
+  }
+
+  function waitForEl(fn, timeoutMs, stepMs) {
+    return (async () => {
+      const t0 = Date.now();
+      while (Date.now() - t0 < timeoutMs) {
+        const el = fn();
+        if (el) return el;
+        await sleep(stepMs || 300);
+      }
+      return null;
+    })();
+  }
+
+  async function clickWebSend(adapter, input, beforeCount, beforeText) {
+    // 上一条还在生成时，发送按钮会被替换成「停止」，此时点/回车都不会发新消息。
+    // 先等它结束（最多 25 秒），避免把字填进去却一直发不出去。
+    for (let i = 0; i < 50 && isWebStreaming(adapter); i++) await sleep(500);
+    let btn = await waitForEl(() => firstVisible(adapter.send), 8000, 250);
+    const isDisabled = (b) => !b || b.disabled || b.getAttribute('aria-disabled') === 'true' ||
+      /(^|\s)disabled(\s|$)/i.test(String(b.className || ''));
+    if (btn) {
+      for (let i = 0; i < 40; i++) {      // 等 aria-disabled 解除，最多 10 秒
+        if (!isDisabled(btn)) break;
+        await sleep(250);
+        btn = firstVisible(adapter.send) || btn;
+      }
+      btn.click();
+    } else {
+      // 没有可识别的发送按钮 → 走回车（多数对话框都支持）
+      input.focus();
+      input.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'Enter', code: 'Enter', keyCode: 13, which: 13 }));
+    }
+    for (let i = 0; i < 16; i++) {
+      await sleep(300);
+      const val = String(input.value || input.textContent || '').trim();
+      if (!val && i >= 2) return;
+      if (countAssistants(adapter) > beforeCount) return;
+      const t = lastAssistantText(adapter);
+      if (t && t !== beforeText) return;
+    }
+    // 点了没反应：再点一次 + 回车（先聚焦输入框，否则站点可能不认回车）
+    if (btn) { try { btn.click(); } catch (e) { /* 忽略 */ } }
+    input.focus();
+    input.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'Enter', code: 'Enter', keyCode: 13, which: 13 }));
+    for (let i = 0; i < 10; i++) {
+      await sleep(300);
+      const val = String(input.value || input.textContent || '').trim();
+      if (!val) return;
+      if (countAssistants(adapter) > beforeCount) return;
+    }
+  }
+
+  async function waitForWebReply(adapter, beforeCount, beforeText, timeoutMs) {
+    const t0 = Date.now();
+    let last = '';
+    let same = 0;
+    let seenNew = false;
+    let lastCount = 0;
+    let lastTxt = '';
+    while (Date.now() - t0 < timeoutMs) {
+      await sleep(800);
+      scrollWebToBottom();
+      lastCount = countAssistants(adapter);
+      lastTxt = lastAssistantText(adapter);
+      if (lastCount > beforeCount || (lastTxt && lastTxt !== beforeText)) seenNew = true;
+      if (seenNew && lastTxt) {
+        if (lastTxt === last) same++;
+        else { same = 0; last = lastTxt; }
+        if (same >= 3 && !isWebStreaming(adapter) && lastTxt.length >= 10) return lastTxt;
+      }
+    }
+    // 压线到达：超时前最后再取一次，别把已经写好的回复丢掉
+    await sleep(500);
+    scrollWebToBottom();
+    const finalCount = countAssistants(adapter);
+    const finalTxt = lastAssistantText(adapter);
+    if ((finalCount > beforeCount || (finalTxt && finalTxt !== beforeText)) && finalTxt.length >= 10) {
+      return finalTxt;
+    }
+    throw new Error('等待回复超时（' + Math.round(timeoutMs / 1000) + ' 秒；消息数 ' + finalCount + '，最后文本 ' + finalTxt.length + ' 字）');
+  }
+
+  function webSelftestReport(adapter) {
+    const lines = ['执行器：' + location.hostname, '阶段：' + webStatusLabel()];
+    const probe = (label, sels) => {
+      lines.push(label + '：');
+      (sels || []).forEach((s) => {
+        let n = 0;
+        try { n = $$(s).filter((e) => visible(e) && notMine(e)).length; } catch (e) { n = 0; }
+        lines.push('  ' + (n ? '✓' : '·') + ' ' + s + ' → ' + n);
+      });
+    };
+    probe('输入框', adapter.input);
+    probe('发送', adapter.send);
+    probe('助手消息', adapter.assistant);
+    probe('停止生成', adapter.stop);
+    probe('Canvas/写作', adapter.canvas);
+    lines.push('助手消息数：' + countAssistants(adapter));
+    lines.push('输入框可见：' + (findWebInput(adapter) ? '是' : '否'));
+    return lines.join('\n');
+  }
+
+  async function executeWebRequest(req, token, adapter, workerIdx) {
+    const t0 = Date.now();
+    const wIdx = Number(workerIdx) || 0;
+    try {
+      if (req.kind === 'selftest') {
+        const report = webSelftestReport(adapter);
+        saveWebReqItem(Object.assign({}, req, { status: 'done', answer: report, raw: report.slice(0, 500), by: token, tookMs: Date.now() - t0 }));
+        log('· [网页] 选择器自检完成');
+        return;
+      }
+      setWebPhase(token, 'filling', req, wIdx);
+      log('· [网页] 开始处理「' + (req.title || req.jobId) + '」');
+      // 每条岗位都必须在项目首页开新会话；不在就交给下一轮重置，绝不往当前旧会话里发
+      if (configIsProject() && !isProjectHome()) {
+        throw new Error('当前页面不在项目页（' + location.pathname + '），本轮不发送');
+      }
+      const input = await waitForEl(() => findWebInput(adapter), 20000, 500);
+      if (!input) throw new Error('找不到输入框（可能未登录、被验证码挡住，或站点结构变了）');
+      input.focus();
+      fillInput(input, req.prompt);
+      await sleep(400);
+      const got = String(input.value || input.textContent || '').trim();
+      if (got.length < Math.min(60, Math.floor(req.prompt.length * 0.4))) {
+        throw new Error('输入框填充失败（只填进 ' + got.length + ' 字）');
+      }
+
+      const beforeCount = countAssistants(adapter);
+      const beforeText = lastAssistantText(adapter);
+      log('· [网页] 已填入并准备发送：基线助手消息 ' + beforeCount + ' 条（文本 ' + beforeText.length + ' 字）');
+      // 填字期间页面可能被站点重定向（项目页 → 首页）；发送前再确认一次
+      if (configIsProject() && !isProjectHome()) {
+        throw new Error('发送前发现页面已离开项目页（' + location.pathname + '），本条不发送');
+      }
+      setWebPhase(token, 'sending', req, wIdx);
+      await clickWebSend(adapter, input, beforeCount, beforeText);
+
+      setWebPhase(token, 'waiting', req, wIdx);
+      let raw = await waitForWebReply(adapter, beforeCount, beforeText, Math.max(30000, Number(cfg.webTimeoutMs) || DEFAULTS.webTimeoutMs));
+
+      setWebPhase(token, 'extracting', req, wIdx);
+      let answer = sanitizeWebReply(raw);
+      if (answer.length < 10) {
+        const cv = extractCanvasText(adapter);
+        if (cv) { raw = cv; answer = sanitizeWebReply(cv); }
+      }
+      if (!answer || answer.length < 10) throw new Error('提取内容异常（长度 ' + answer.length + '）');
+      // 回复必须来自项目内的会话。若被带到首页（/c/… 而不是 /g/…/c/…），
+      // 说明这次没带项目指令，宁可报错重来，也不把不合规的话术交上去。
+      if (configIsProject() && !isInProjectContext()) {
+        const cfgId = projectId();
+        const curId = projectIdFromPath(new URL(location.href).pathname);
+        throw new Error('回复来自项目外的会话（配置=' + cfgId + '，当前=' + curId + '，URL=' + location.href + '），本条不采用');
+      }
+
+      saveWebReqItem(Object.assign({}, req, {
+        status: 'done', answer: answer, raw: String(raw || '').slice(0, 500),
+        by: token, tookMs: Date.now() - t0, convUrl: location.href
+      }));
+      if (wIdx > 0) {
+        saveWebWorkerState(wIdx, {
+          tabToken: token, tick: Date.now(), phase: 'idle', jobId: '',
+          rounds: 0, resetCount: 0, resetAt: 0, convUrl: location.href, url: location.href
+        });
+      } else {
+        saveWebState({
+          tabToken: token, tick: Date.now(), phase: 'idle', jobId: '',
+          rounds: 0, resetCount: 0, resetAt: 0, convUrl: location.href, url: location.href
+        });
+      }
+      log('✓ [网页] 完成「' + (req.title || req.jobId) + '」：' + answer.slice(0, 24) + '…（' + Math.round((Date.now() - t0) / 1000) + 's）');
+      // v0.8.8：执行器不自己关闭标签页，等调度方读取结果后再关闭
+      // 进入空闲状态，等待下一条指令或关闭信号
+      return;
+    } catch (e) {
+      saveWebReqItem(Object.assign({}, req, {
+        status: 'error', error: String((e && e.message) || e), by: token, tookMs: Date.now() - t0
+      }));
+      if (wIdx > 0) {
+        saveWebWorkerState(wIdx, { tabToken: token, tick: Date.now(), phase: 'idle', jobId: '', url: location.href });
+      } else {
+        saveWebState({ tabToken: token, tick: Date.now(), phase: 'idle', jobId: '', url: location.href });
+      }
+      log('✗ [网页] 「' + (req.title || req.jobId) + '」失败：' + String((e && e.message) || e));
+    }
+  }
+
+  let warnedConvUrl = false;
+  async function runWebWorker(token) {
+    isWebWorker = true;
+    rememberWebToken(token);
+    // 身份分两层：URL 上的 token 说明「这页是脚本开的」；tabId 是这一页自己的运行身份。
+    // 复制标签页会把 sessionStorage 一起复制过去，两个标签会拿到同一个 token ——
+    // 所以认领/心跳一律用每次加载新生成的 tabId，避免两个执行方同时消费同一队列。
+    const tabId = 'w' + uid() + uid();
+    // v0.9.0：从 token 解析 worker 索引，写入对应的 per-worker 状态
+    const workerIdx = parseWorkerIdx(token);
+    // v0.9.0 fix：从 URL hash 读取 targetRid，只认领指定的请求（避免多 tab 抢同一条）
+    let targetRid = null;
+    try {
+      const hashParams = new URLSearchParams(location.hash.replace(/^#/, ''));
+      targetRid = hashParams.get('rid') || null;
+    } catch (e) { /* 忽略 */ }
+    try { document.title = WEB_TITLE + (workerIdx > 0 ? ' W' + workerIdx : ''); } catch (e) {}
+    log('· 网页执行器' + (workerIdx > 0 ? ' W' + workerIdx : '') + '已启动（' + tabId + '）' + (targetRid ? '，指定请求 ' + targetRid : '') + '：只处理一条岗位，完成后关闭标签页');
+
+    const adapter = pickWebAdapter();
+    holdKeepAlive('bgWebKeepAlive');
+    // v0.9.0：心跳写入 per-worker 状态，不覆盖其他 worker
+    const workerStateKey = webWorkerKey(workerIdx);
+    const beat = () => {
+      const st = load(workerStateKey, {}) || {};
+      if (st.tabToken && st.tabToken !== tabId && Date.now() - Number(st.tick || 0) < 15000) return;
+      save(workerStateKey, Object.assign({}, st, { tabToken: tabId, tick: Date.now(), url: location.href }));
+    };
+    beat();
+    setInterval(beat, 2000);
+
+    // v0.8.8：每个标签页只处理一条岗位，完成后等待调度方关闭
+    if (webNavigating) { await sleep(5000); return; }
+    const st0 = load(workerStateKey, {}) || {};
+    if (Number(st0.cooldownUntil || 0) > Date.now()) { await sleep(10000); return; }
+    if (st0.tabToken && st0.tabToken !== tabId && Date.now() - Number(st0.tick || 0) < 15000) return;
+    if (isConversationUrl(cfg.webUrl)) {
+      if (!warnedConvUrl) { warnedConvUrl = true; log('✗ 网址是具体会话，无法新建'); }
+      return;
+    }
+    let waited = 0;
+    while (!isProjectHome() && waited < 15000) { await sleep(1000); waited += 1000; }
+    if (!isProjectHome()) { log('✗ 15秒内未到达项目首页'); return; }
+    // v0.9.0 fix：有 targetRid 时只认领指定的请求，避免多 tab 抢同一条
+    const req = targetRid ? pickWebReqByRid(targetRid, tabId) : pickWebRequest(tabId);
+    if (!req) { log('· 没有待处理请求' + (targetRid ? '（指定 rid=' + targetRid + ' 未找到或已被认领）' : '')); return; }
+    await executeWebRequest(req, tabId, adapter, workerIdx);
+    // 执行完成后，等待调度方关闭信号（最多等30秒）
+    log('· [网页] 等待调度方关闭标签页...');
+    for (let i = 0; i < 60; i++) {
+      await sleep(500);
+      const st = load(workerStateKey, {}) || {};
+      // 调度方设置 closeRequested=true 表示可以关闭
+      if (st.closeRequested && st.tabToken === tabId) {
+        log('· [网页] 收到关闭信号，标签页关闭');
+        try { window.close(); } catch (e) {}
+        return;
+      }
+    }
+    // 超时未收到关闭信号，自动关闭
+    log('· [网页] 关闭信号超时，自动关闭');
+    try { window.close(); } catch (e) {}
+  }
+
+  /* ----------------------------- 选择器自检（调度方发起） ----------------------------- */
+
+  async function webSelftest() {
+    const ready = await ensureWebWorker();
+    if (!ready) { log('✗ 网页执行器没起来，无法自检'); return; }
+    const rid = 's' + uid() + Date.now().toString(36);
+    saveWebReqItem({ rid, kind: 'selftest', jobId: 'selftest', title: '选择器自检', prompt: '', status: 'pending', createdAt: Date.now(), attempts: 0 });
+    const res = await waitWebResult(rid, 30000);
+    if (res.status === 'done' && res.answer) {
+      log('—— 选择器自检结果 ——');
+      String(res.answer).split('\n').forEach((l) => log(l));
+      log('—— 自检结束 ——');
+    } else {
+      log('✗ 自检失败：' + (res.error || '没有返回'));
+    }
   }
 
   /* ------------------- 并发生成：同一条岗位只允许一路在飞 -------------------
@@ -2042,7 +3051,9 @@
   function draftFp(id) {
     const job = jobs.find((j) => j.id === id) || {};
     const parts = [getResume(), jobForPrompt(job), cfg.model, cfg.systemPrompt, cfg.userPrompt,
-      String(cfg.temperature), String(cfg.resumeChars)];
+      String(cfg.temperature), String(cfg.resumeChars),
+      // v0.8.0：换生成方式、换拼接项、换网页地址，旧草稿都算过期（免得把按旧提示词写的话发出去）
+      String(cfg.genMode), JSON.stringify(cfg.webParts || {}), String(cfg.webUrl || '')];
     return hashStr(parts.join('\u0001'));
   }
   function isDraftStale(id) {
@@ -2669,6 +3680,10 @@
 
   async function runBatch(ids) {
     if (runner.running) { log('批量任务已在运行'); return; }
+    // 这一轮可能跑在后台「生成器」标签页里：拿一把锁，别让 Chrome 把等待/暂停的定时器压到 1 分钟一次
+    holdKeepAlive('bgBatchKeepAlive');
+    // v0.8.0：网页模式走串行分支；API 分支一行不动。
+    if (cfg.genMode === 'web') return runBatchWeb(ids);
     // 开跑前先把这一页的视图对齐存储：接管别人被打断的那一轮时，手里这份快照可能是老的，
     // 拿它判「哪几条还没草稿」会把已经写好的重做一遍，拿它整块回写还会把人家抹掉。
     syncFromStorage();
@@ -2876,15 +3891,184 @@
     saveLog(true);   // 「还剩几条」这行必须进存储：下一页就是靠它知道自己该接什么
   }
 
+  /* ---------------- v0.9.0：网页模式的并行批量 ----------------
+   * 支持多 tab 并发生成，每个 worker 持有独立的 executor tab 和 per-worker 状态。
+   * 并发数 = cfg.webConcurrency（默认 3，UI 可调）。
+   * 单 tab 模式（webConcurrency=1）仍走串行逻辑，与 v0.8.x 行为一致。
+   */
+  async function runBatchWeb(ids) {
+    syncFromStorage();
+    runner.running = true; runner.paused = false; stopReq = false;
+    updateRunnerUI();
+    let targets = (ids || []).slice();
+    const sentIds = targets.filter((id) => drafts[id] && drafts[id].sent);
+    targets = targets.filter((id) => !(drafts[id] && drafts[id].sent));
+    if (sentIds.length) log('· 跳过 ' + sentIds.length + ' 个已发送过的岗位');
+    if (cfg.autoSend) {
+      const room = Math.max(0, Number(cfg.maxPerDay) - stats.sent);
+      if (room <= 0) { log('已达今日发送上限 ' + cfg.maxPerDay + '，停止'); runner.running = false; updateRunnerUI(); return; }
+      if (targets.length > room) { log('受今日上限限制，本轮只处理前 ' + room + ' 个'); targets = targets.slice(0, room); }
+    }
+    refreshDetails();
+    writePlan(targets, true, isExec ? 'exec' : 'page');
+    batchTargets = targets.slice();
+    startBeat();
+
+    const conc = Math.min(10, Math.max(1, Math.round(Number(cfg.webConcurrency) || 1)));
+
+    // 串行模式（webConcurrency=1）：保持 v0.8.x 行为
+    if (conc === 1) {
+      log('· 网页模式：串行生成 ' + targets.length + ' 条（每条岗位独立会话，先回项目页再发）');
+      const ready = await ensureWebWorker();
+      if (!ready) {
+        log('✗ 网页执行器没起来，本轮不开始（去「队列」页点「打开/验证网页标签」看看卡在哪）');
+        runner.running = false; updateRunnerUI(); finishPlan(targets);
+        saveLog(true);
+        return;
+      }
+      let failStreak = 0;
+      for (let i = 0; i < targets.length; i++) {
+        const id = targets[i];
+        if (!runner.running) break;
+        while (runner.paused && runner.running) await sleep(500);
+        if (!runner.running) break;
+        pullSignals();
+        if (!runner.running) break;
+        if (!isSelected(id)) { log('· 已取消勾选，跳过「' + jobTitle(id) + '」'); continue; }
+        setJobState(id, '网页生成中');
+        try {
+          await generateOneWeb(id);
+          failStreak = 0;
+          setJobState(id, cfg.autoSend ? '待发送' : '待确认');
+          if (cfg.autoSend) {
+            if (Number(cfg.maxPerDay) - stats.sent <= 0) { log('触达今日发送上限，停止'); break; }
+            await sendOne(id);
+            updateRunnerUI();
+            await sleep(rnd(cfg.delayMin, cfg.delayMax));
+          } else {
+            log('已生成草稿，去「队列」页确认后点发送 → ' + jobTitle(id));
+          }
+        } catch (e) {
+          if (e && e.noJd) {
+            setJobState(id, '缺 JD 已跳过');
+            log('✗ 跳过「' + jobTitle(id) + '」：' + e.message);
+            continue;
+          }
+          failStreak++;
+          setJobState(id, '出错');
+          log('✗ ' + jobTitle(id) + ' 失败：' + e.message);
+          if (failStreak >= 2 && /输入框|新建对话|提取内容异常/.test(String(e.message || ''))) {
+            log('· 连续 ' + failStreak + ' 条同类失败，停止本轮（先解决网页标签那边的问题再继续）');
+            break;
+          }
+        }
+        if (i < targets.length - 1) await sleep(rnd(1200, 2500));
+      }
+      runner.running = false; updateRunnerUI(); renderQueue();
+      finishPlan(targets);
+      log('网页批量结束（今日已发 ' + stats.sent + '/' + cfg.maxPerDay + '）');
+      saveLog(true);
+      return;
+    }
+
+    // 并行模式（webConcurrency > 1）：worker pool
+    log('· 网页模式：并行生成 ' + targets.length + ' 条（' + conc + ' 路并发，每条岗位独立会话）');
+
+    // 验证网址
+    if (isConversationUrl(cfg.webUrl)) {
+      log('✗ 网址是具体会话（/c/…），无法为每条岗位新建会话。请到「队列 → 网页调用」改成项目页/新对话页');
+      runner.running = false; updateRunnerUI(); finishPlan(targets);
+      saveLog(true);
+      return;
+    }
+
+    let nextIdx = 0;           // 原子索引，防止多 worker 领到同一 job
+    let completedCount = 0;
+    let failedCount = 0;
+    let stoppedByFailStreak = false;
+    let perWorkerFailStreak = new Array(conc).fill(0);  // 每个 worker 的连续失败计数
+
+    async function webWorker(workerIdx) {
+      while (runner.running && !stoppedByFailStreak) {
+        if (runner.paused) { await sleep(500); continue; }
+        pullSignals();
+        if (!runner.running || stoppedByFailStreak) break;
+
+        const myIdx = nextIdx++;
+        if (myIdx >= targets.length) break;
+        const id = targets[myIdx];
+
+        if (!isSelected(id)) {
+          log('· 已取消勾选，跳过「' + jobTitle(id) + '」');
+          completedCount++;
+          continue;
+        }
+
+        setJobState(id, '网页生成中');
+        updateRunnerUI();
+        try {
+          const res = await generateOneWebParallel(id, workerIdx);
+          if (res.status === 'done' && res.answer) {
+            perWorkerFailStreak[workerIdx] = 0;
+            setJobState(id, cfg.autoSend ? '待发送' : '待确认');
+            if (cfg.autoSend) {
+              if (Number(cfg.maxPerDay) - stats.sent <= 0) { log('触达今日发送上限，停止'); runner.running = false; break; }
+              await sendOne(id);
+              updateRunnerUI();
+            }
+            completedCount++;
+            log('✓ [W' + workerIdx + '] 完成 ' + completedCount + '/' + targets.length + '：' + jobTitle(id));
+          } else {
+            throw new Error(res.error || '网页生成失败');
+          }
+        } catch (e) {
+          if (e && e.noJd) {
+            setJobState(id, '缺 JD 已跳过');
+            log('✗ 跳过「' + jobTitle(id) + '」：' + e.message);
+            completedCount++;
+            continue;
+          }
+          perWorkerFailStreak[workerIdx]++;
+          failedCount++;
+          setJobState(id, '出错');
+          log('✗ [W' + workerIdx + '] ' + jobTitle(id) + ' 失败：' + e.message);
+          // 单个 worker 连续 2 次同类失败 → 该 worker 停止，其他 worker 继续
+          if (perWorkerFailStreak[workerIdx] >= 2 && /输入框|新建对话|提取内容异常/.test(String(e.message || ''))) {
+            log('· W' + workerIdx + ' 连续 ' + perWorkerFailStreak[workerIdx] + ' 次同类失败，该 worker 停止');
+            break;
+          }
+        }
+        // 两条之间喘口气，减轻站点压力（并行时间隔可缩短）
+        if (myIdx < targets.length - 1) await sleep(rnd(600, 1200));
+      }
+    }
+
+    const t0 = Date.now();
+    const workers = [];
+    for (let w = 0; w < conc; w++) {
+      workers.push(webWorker(w));
+    }
+    await Promise.all(workers);
+
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    runner.running = false; updateRunnerUI(); renderQueue();
+    finishPlan(targets);
+    log('网页并行批量结束：' + targets.length + ' 条，完成 ' + completedCount + '，失败 ' + failedCount + '，耗时 ' + elapsed + 's（今日已发 ' + stats.sent + '/' + cfg.maxPerDay + '）');
+    saveLog(true);
+  }
+
   // 自动模式：开一个岗位页标签，让它跑「点沟通入口 -> 跳到沟通页 -> 填 -> 发」。
   // 关键：点「继续沟通」大概率是整页跳转，跳过去之后原来那个 JS 上下文连同这里的 await
   // 一起被销毁，回执只能由跳转后的沟通页写（见 writeHop / runHopSend）。
   // fillOnly=true 时走到沟通页只把话填好、不点发送（半自动走这条）。
   async function sendInJobTab(job, text, fillOnly) {
+    // v0.8.9 debug：输出发送用的 URL 和 job ID
+    log('[sendInJobTab] job.id=' + job.id + ', job.url=' + job.url + ', title=' + (job.title || ''));
     GM_setValue('sendReq', {
       url: job.url, text: text, id: job.id, ts: Date.now(),
       title: job.title || '', company: job.company || '', fillOnly: !!fillOnly
     });
+    log('[sendInJobTab] 已写 sendReq，打开标签页：' + job.url);
     GM_openInTab(job.url, { active: true, insert: true, setParent: true });
     const out = await waitSendReceipt(job, 60000, 12000);
     if (!out) {
@@ -3114,7 +4298,12 @@
     }
     // 沟通界面就地出现在这一页（SPA 没换上下文）：照样走「确认会话身份 → 填 → 发」那一套。
     // 不能因为「按钮是我照着 jobId 点的」就省掉确认 —— 站点完全可能把上一个会话选中。
-    return await runHopSend(hop);
+    const res = await runHopSend(hop);
+    // v0.9.0：发送成功后自动关闭标签页（脚本打开的标签完成任务后关闭，节省内存）
+    if (cfg.autoCloseDetail && res && res.ok) {
+      setTimeout(() => { try { window.close(); } catch (e) {} }, 2500);
+    }
+    return res;
   }
 
   // 详情页那条入口的收尾：点完沟通按钮，输入框就地出现在这一页（SPA 没换上下文）时，填 + 发 + 回执。
@@ -3131,6 +4320,10 @@
     const res = await sendIntoChat(inp, req.text, req.id);
     if (res.ok) GM_setValue('sendDone:' + req.id + location.href, true);
     clearHop();
+    // v0.9.0：发送成功后自动关闭标签页（脚本打开的标签完成任务后关闭，节省内存）
+    if (cfg.autoCloseDetail && res.ok) {
+      setTimeout(() => { try { window.close(); } catch (e) {} }, 2500);
+    }
     return reportSend(req, res);
   }
 
@@ -3327,18 +4520,28 @@
   // 在「被脚本打开的岗位详情页」里执行发送（列表入口走不通时的退回路线）
   async function maybeHandleSendRequest() {
     const req = GM_getValue('sendReq', null);
+    log('[maybeHandleSendRequest] req=' + (req ? JSON.stringify({id: req.id, url: req.url, via: req.via}) : 'null'));
     if (!req || !req.url) return;
     if (req.via === 'list') return;              // 列表入口的请求由 runListSend 负责，别在这一页点第二遍
-    if (!sameJobPage(req.url, location.href)) return;
-    if (GM_getValue('sendDone:' + req.id + location.href, false)) return;
+    if (!sameJobPage(req.url, location.href)) {
+      log('[maybeHandleSendRequest] sameJobPage=false, req.url=' + req.url + ', location=' + location.href);
+      return;
+    }
+    if (GM_getValue('sendDone:' + req.id + location.href, false)) {
+      log('[maybeHandleSendRequest] sendDone=true, 跳过');
+      return;
+    }
+    log('[maybeHandleSendRequest] 开始处理，等待 1.8~3.2 秒...');
     await sleep(rnd(1800, 3200));
 
     let inp = findChatInput();
+    log('[maybeHandleSendRequest] findChatInput=' + (inp ? 'found' : 'null'));
     if (!inp) {
       if (!(cfg.autoOpenChat || cfg.autoSend)) {
         return reportSend(req, { ok: false, why: '这一页没有聊天输入框，而「自动点击立即沟通」没勾上，脚本就不自己点了（要自动就回「设置」勾上）' });
       }
       const entry = findChatEntry();
+      log('[maybeHandleSendRequest] findChatEntry=' + (entry ? 'found: ' + (entry.innerText || '').trim() : 'null'));
       if (!entry) {
         return reportSend(req, { ok: false, why: '岗位页上没找到「立即沟通/继续沟通」按钮（可能站点改版，或这个岗位已经不能沟通）' });
       }
@@ -4246,15 +5449,120 @@
   /* ---- 队列页 ---- */
   function renderQueue() {
     if (curTab !== 'queue') { updateStat(); return; }
+    const isWeb = cfg.genMode === 'web';
+    const wp = cfg.webParts || {};
     bodyEl.innerHTML =
+      // 方式选择：API / 网页，2 选 1，只展示一个面板
+      '<div class="mode-toggle">' +
+      '<input type="radio" name="gen_mode" id="gmode_api" value="api" ' + (!isWeb ? 'checked' : '') + '>' +
+      '<label for="gmode_api">API 调用</label>' +
+      '<input type="radio" name="gen_mode" id="gmode_web" value="web" ' + (isWeb ? 'checked' : '') + '>' +
+      '<label for="gmode_web">网页调用</label>' +
+      '</div>' +
+
+      '<div id="q_api_panel" class="model-panel' + (!isWeb ? ' on' : '') + '">' +
+      '<fieldset><legend>API 调用</legend>' +
+      '<div class="mini">当前模型：<b>' + esc(cfg.model || '未配置') + '</b>（多模型并行在「设置」页配置）</div>' +
+      '<div class="hint">生成走 /chat/completions，可并发；发送仍逐条排队。</div>' +
+      '</fieldset>' +
+      '</div>' +
+
+      '<div id="q_web_panel" class="model-panel' + (isWeb ? ' on' : '') + '">' +
+      '<fieldset><legend>网页版 LLM</legend>' +
+      '<label>网址（项目页 / 新对话页，别填 /c/ 具体会话）</label>' +
+      '<input id="qw_url" value="' + esc(cfg.webUrl || '') + '" placeholder="https://chatgpt.com/g/g-xxx/project">' +
+      '<div class="btns">' +
+      '<button class="act pri" id="qw_open" type="button">打开/验证网页标签</button>' +
+      '<button class="act" id="qw_check" type="button">选择器自检</button>' +
+      '</div>' +
+      '<div class="mini" style="margin:2px 0 6px">状态：<span id="qw_state">' + esc(webStatusLabel()) + '</span></div>' +
+      '<div class="row" style="align-items:center;gap:8px;margin-bottom:6px">' +
+      '<div><label>单条超时(秒)</label><input id="qw_timeout" type="number" min="30" value="' + Math.round((Number(cfg.webTimeoutMs) || 180000) / 1000) + '"></div>' +
+      '<div><label>并行网页数</label><input id="qw_concurrency" type="number" min="1" max="10" value="' + (Number(cfg.webConcurrency) || 1) + '"></div>' +
+      '</div>' +
+      '<div class="hint">每条岗位都会重新打开上面的网址，开一个全新会话；不会在旧会话里接着追问。</div>' +
+      '<div class="hint">ChatGPT 思考 + 写作常见 20–90 秒，超时建议填 90–180。</div>' +
+      '<div class="hint">并行网页数 = 同时打开的 LLM 标签数（1=串行，建议 2-5，上限 10）。</div>' +
+      '<div style="font-size:12px;margin:6px 0 2px;color:#5a6675">拼接内容：</div>' +
+      '<div class="btns" style="gap:10px">' +
+      '<label class="mini" style="margin:0"><input type="checkbox" id="qw_p_system" ' + (wp.system !== false ? 'checked' : '') + ' style="width:auto"> System</label>' +
+      '<label class="mini" style="margin:0"><input type="checkbox" id="qw_p_user" ' + (wp.user !== false ? 'checked' : '') + ' style="width:auto"> User</label>' +
+      '<label class="mini" style="margin:0"><input type="checkbox" id="qw_p_resume" ' + (wp.resume !== false ? 'checked' : '') + ' style="width:auto"> 简历</label>' +
+      '<label class="mini" style="margin:0"><input type="checkbox" id="qw_p_job" ' + (wp.job !== false ? 'checked' : '') + ' style="width:auto"> 岗位详情</label>' +
+      '</div>' +
+      '<div class="btns"><button class="act" id="qw_preview" type="button">预览最终提示词</button>' +
+      '<button class="act pri" id="qw_save" type="button">保存网页调用配置</button></div>' +
+      '<textarea id="qw_preview_box" rows="8" readonly style="display:none;margin-top:4px"></textarea>' +
+      '<div class="hint">网页模式：并行数=1 时串行生成；>1 时多标签并行，每条岗位独立会话；标签完成后自动关闭。</div>' +
+      '</fieldset>' +
+      '</div>' +
+
       '<fieldset><legend>生成与发送</legend>' +
       '<div class="btns"><button class="act pri" id="q_run">' + (isRunning() ? '停止批量' : '开始批量') + '</button>' +
       '<button class="act" id="q_pause">' + (isPaused() ? '继续' : '暂停') + '</button>' +
-      '<span class="mini" style="flex:0 0 auto">' + (cfg.autoSend ? '全自动' : '半自动') + '</span>' +
+      '<span class="mini" style="flex:0 0 auto">' + (cfg.autoSend ? '全自动' : '半自动') + ' · ' + (isWeb ? '网页' : 'API') + '</span>' +
       (isRunning() || !planLeft(readPlan()).length ? '' :
         '<button class="act pri" id="q_resume">继续上次批量（剩 ' + planLeft(readPlan()).length + ' 条）</button>') +
       '</div>' +
       '</fieldset><div id="q_list"></div>';
+
+    // 方式切换（radio 2 选 1，显式显隐，不用 toggle 避免状态漂移）
+    $$('input[name=gen_mode]', bodyEl).forEach((r) => r.addEventListener('change', () => {
+      cfg.genMode = r.value === 'web' ? 'web' : 'api';
+      saveCfg();
+      log('· 生成方式已切换为：' + (cfg.genMode === 'web' ? '网页调用' : 'API 调用'));
+      renderQueue();
+    }));
+
+    const qwSave = () => {
+      // 地址无效时保留原地址，绝不悄悄退回「chatgpt.com 首页」——
+      // 那样每条岗位都会在项目外生成，项目指令全失效。
+      const rawUrl = cleanCfgStr($('#qw_url', bodyEl).value);
+      if (!rawUrl) {
+        log('· 网页地址不能为空，保留原地址：' + (cfg.webUrl || '（还没设置）'));
+      } else if (!/^https?:\/\//i.test(rawUrl)) {
+        log('· 网页地址必须以 http:// 或 https:// 开头，保留原地址：' + (cfg.webUrl || '（还没设置）'));
+      } else {
+        cfg.webUrl = rawUrl;
+      }
+      cfg.webTimeoutMs = Math.max(30000, (Number($('#qw_timeout', bodyEl).value) || 180) * 1000);
+      cfg.webConcurrency = Math.min(10, Math.max(1, Math.round(Number($('#qw_concurrency', bodyEl).value) || 1)));
+      cfg.webParts = {
+        system: $('#qw_p_system', bodyEl).checked,
+        user: $('#qw_p_user', bodyEl).checked,
+        resume: $('#qw_p_resume', bodyEl).checked,
+        job: $('#qw_p_job', bodyEl).checked
+      };
+      saveCfg();
+      log('✓ 网页调用配置已保存');
+      renderQueue();
+    };
+    const qwSaveBtn = $('#qw_save', bodyEl);
+    if (qwSaveBtn) qwSaveBtn.addEventListener('click', qwSave);
+    const qwOpen = $('#qw_open', bodyEl);
+    if (qwOpen) qwOpen.addEventListener('click', async () => { qwSave(); await openWebTab(true); if (curTab === 'queue') renderQueue(); });
+    const qwCheck = $('#qw_check', bodyEl);
+    if (qwCheck) qwCheck.addEventListener('click', async () => { qwSave(); await webSelftest(); if (curTab === 'queue') renderQueue(); });
+    const qwPrev = $('#qw_preview', bodyEl);
+    if (qwPrev) qwPrev.addEventListener('click', () => {
+      qwSave();
+      const box = $('#qw_preview_box', bodyEl);
+      if (!box) return;
+      const sel = selected()[0] || jobs[0];
+      if (!sel) { log('· 先在「岗位」页抓几个岗位，预览才有岗位内容可拼'); return; }
+      try {
+        const { job, resume } = prepareJob(sel.id);
+        box.value = buildWebPrompt(job, resume);
+      } catch (e) {
+        // 没 JD 的岗位也能预览（只是没有岗位详情段），这里退化成用标题/薪资拼
+        box.value = buildWebPrompt(sel, getResume());
+      }
+      if (!String(box.value || '').trim()) {
+        box.value = '（当前勾选组合拼不出内容：至少勾选 System / User / 简历 / 岗位详情 中的一项）';
+      }
+      box.style.display = 'block';
+      box.scrollTop = 0;
+    });
 
     $('#q_run', bodyEl).addEventListener('click', () => {
       if (runner.running) {
@@ -4304,10 +5612,11 @@
       // 以前只写「生成」，用户按设置页那句「全自动：生成后自动开沟通页发送」去理解，
       // 结果还得自己在同一行再找「发送」，等于多一步确认。
       const tail = cfg.autoSend ? '并发送' : '';
+      const genWord = cfg.genMode === 'web' ? '网页生成' : '生成';
       const genBtn = jd
-        ? '<button class="act gen">' + (d ? '重新生成' + tail : '生成' + tail) + '</button>'
+        ? '<button class="act gen">' + (d ? '重新' + genWord : genWord) + tail + '</button>'
         : canFetch
-          ? '<button class="act fgen">' + (d ? '补抓详情后重新生成' + tail : (cfg.autoSend ? '补抓详情后生成并发送' : '补抓详情并生成')) + '</button>'
+          ? '<button class="act fgen">' + (d ? '补抓详情后重新' + genWord : ('补抓详情后' + genWord + tail)) + '</button>'
           : '<button class="act ngen">缺 JD 不能生成</button>';
       return '<div class="job" data-id="' + esc(j.id) + '"><div class="t"><b>' + esc(j.title) + '</b>' +
         '<i>' + esc([j.company, j.salary].filter(Boolean).join(' · ')) + '</i>' +
@@ -4356,8 +5665,12 @@
         const live = queueRow(id);
         const lb = live && $('.gen, .fgen', live);
         if (lb) lb.textContent = '生成中';
-        // 单条手点「生成」：用第一个模型（cfg.models[0]），保证同一条岗位重跑时永远走同一个模型。
-        generateShared(id, cfg.models[0]).then(async (t) => {
+        // 单条手点：API 模式用第一个模型（保证同一条岗位重跑时永远走同一个模型）；
+        // 网页模式交给后台执行器，串行处理。
+        const genTask = cfg.genMode === 'web'
+          ? generateOneWeb(id)
+          : generateShared(id, cfg.models[0]);
+        genTask.then(async (t) => {
           log('已生成：' + t.slice(0, 24) + '...');
           renderQueue();
           // 全自动：生成完直接接着发出去，不用再点第二次（半自动仍然停在草稿上等你审）。
@@ -4453,20 +5766,63 @@
 
   /* ---------------------------------------------------------------- 启动 */
 
-  GM_registerMenuCommand('打开/显示助手面板', () => {
-    if (!panel) buildPanel();
-    panel.style.display = 'flex';
-    const min = $('#bgMin'); if (min) min.style.display = 'none';
-  });
-  GM_registerMenuCommand('重置全部本地数据', () => {
-    [K.cfg, K.resume, K.jobs, K.details, K.drafts, K.stats, K.pending, K.batch, K.logbuf, K.exec, K.execLog,
-     K.scoutCfg, K.scoutProgress, K.scoutReport].forEach((k) => GM_deleteValue(k));
-    const swept = sweepSentCreds();   // 每条岗位的「已发出」凭证是一条一个键，按前缀扫掉
-    log('已清空' + (swept ? '（含 ' + swept + ' 条「已发出」凭证）' : '') + '，刷新页面生效');
-  });
+  // v0.8.0 起 @match 是 *://*/*（为了支持任意网页版 LLM），所以所有「只属于 BOSS 页」的
+  // 菜单与快捷键必须先过这道闸门：非 zhipin 页面不注册菜单、不监听快捷键、不建面板。
+  const ON_ZHIPIN = isZhipinHost() || TEST_MODE;
+
+  if (ON_ZHIPIN) {
+    GM_registerMenuCommand('打开/显示助手面板', () => {
+      if (!panel) buildPanel();
+      panel.style.display = 'flex';
+      const min = $('#bgMin'); if (min) min.style.display = 'none';
+    });
+    GM_registerMenuCommand('重置全部本地数据', () => {
+      [K.cfg, K.resume, K.jobs, K.details, K.drafts, K.stats, K.pending, K.batch, K.logbuf, K.exec, K.execLog,
+       K.webReq, K.webState, K.webLog, K.scoutCfg, K.scoutProgress, K.scoutReport].forEach((k) => GM_deleteValue(k));
+      // 网页请求是一条一个键，按前缀扫掉
+      try {
+        (GM_listValues() || []).filter((k) => String(k).indexOf(WEB_REQ_PREFIX) === 0).forEach((k) => GM_deleteValue(k));
+      } catch (e) { /* 忽略 */ }
+      const swept = sweepSentCreds();   // 每条岗位的「已发出」凭证是一条一个键，按前缀扫掉
+      log('已清空' + (swept ? '（含 ' + swept + ' 条「已发出」凭证）' : '') + '，刷新页面生效');
+    });
+
+    // 只有「这一页自己就是执行者」时才拦你离开 —— 平时执行者是后台那个生成器标签页，
+    // 这一页跳走什么也不会打断，弹一道「是否离开网站？」纯属添乱（v0.5.4 之前它每轮都要弹一次）。
+    window.addEventListener('beforeunload', (e) => {
+      if (!runner.running) return;
+      saveLog(true);
+      e.preventDefault();
+      e.returnValue = '批量任务正在进行：离开这一页会把它打断（剩下的条数可以在「队列」页点「继续上次批量」接上）';
+      return e.returnValue;
+    });
+    // 移动端/后台标签被系统回收时不一定走 beforeunload，pagehide 兜最后一份日志
+    window.addEventListener('pagehide', () => { saveLog(true); });
+
+    document.addEventListener('keydown', (e) => {
+      if (e.altKey && (e.key === 'p' || e.key === 'P')) {
+        if (!panel) buildPanel();
+        else { const on = panel.style.display !== 'none'; panel.style.display = on ? 'none' : 'flex'; $('#bgMin').style.display = on ? 'block' : 'none'; }
+        e.preventDefault();
+      }
+    });
+  }
 
   function boot() {
-    // ⓪ 「生成器」标签页排在最前面认领。它开出来的地址往往本身就是列表页或岗位详情页，
+    // ⓪ v0.8.0 全站匹配的第一道闸门：非 BOSS 页面只可能是「网页版 LLM 执行器」。
+    //    必须同时满足「带 token」+「与配置的 webUrl 同源」，否则什么都不做。
+    if (!isZhipinHost()) {
+      if (TEST_MODE) { /* 离线冒烟页：按 BOSS 页面继续往下走 */ }
+      else if (webToken && webOriginOk()) {
+        isWebWorker = true;
+        rememberWebToken(webToken);
+        runWebWorker(webToken);
+        return;
+      } else {
+        return;
+      }
+    }
+    // ⓪.5 「生成器」标签页排在最前面认领。它开出来的地址往往本身就是列表页或岗位详情页，
     //    晚一步就会被下面那几条当成「发作用的标签」「抓详情用的标签」抢走（然后自己关掉），
     //    这一轮就永远没人跑了 —— 和 v0.5.0 里发送标签必须排在详情标签前面是同一个道理。
     const ex = execRequest();
@@ -4491,13 +5847,23 @@
       runListSend(req);
       return;   // 发送用的列表页标签不建面板，免得用户以为要在这儿操作
     }
-    if (req && req.via !== 'list' && req.url && sameJobPage(req.url, location.href)) {
-      maybeHandleSendRequest();
-      return;   // 发送用的标签页不建面板，免得用户以为要在这儿操作
+    if (req && req.via !== 'list' && req.url) {
+      // v0.8.9 debug：输出 URL 比对信息，帮助诊断推荐列表发送卡住的问题
+      const reqJobId = jobIdFromHref(req.url);
+      const curJobId = jobIdFromHref(location.href);
+      const samePage = sameJobPage(req.url, location.href);
+      log('[boot] sendReq.url=' + req.url + ' | location=' + location.href);
+      log('[boot] reqJobId=' + reqJobId + ' | curJobId=' + curJobId + ' | samePage=' + samePage);
+      if (samePage) {
+        maybeHandleSendRequest();
+        return;   // 发送用的标签页不建面板，免得用户以为要在这儿操作
+      }
+      log('[boot] sameJobPage=false，跳过发送处理，继续检查是否是详情抓取标签');
     }
     // 后台标签页：被脚本打开时自动抓详情，不显示面板
     const hit = isDetailTab();
     if (hit) {
+      log('[boot] 命中详情抓取标签：' + hit.id + ' -> ' + hit.url);
       (async () => {
         await sleep(rnd(2000, 3500));
         const n = scrapeDetail(hit.id);
@@ -4508,11 +5874,18 @@
     }
 
     buildPanel();
+    // 网页模式的请求队列一条一个键，开机顺手扫一遍：只留 20 分钟内、未放弃的记录
+    try { cleanupWebReq(); } catch (e) { /* 忽略 */ }
     // 跨标签数据回收：轮询 GM 存储（JD 是后台标签写进去的，见 refreshDetails）
     setInterval(() => {
       if (refreshDetails()) renderJobs();
       const p = load(K.pending, []) || [];
       if (p.length !== pending.length) pending = p;
+      // 队列页的网页执行器状态灯：每两秒跟着心跳刷新（只改文本，不重画整页，避免按钮失焦）
+      if (curTab === 'queue') {
+        const el = document.getElementById('qw_state');
+        if (el) el.textContent = webStatusLabel();
+      }
     }, 2000);
 
     if (getResume()) log('已加载简历缓存 ' + getResume().length + ' 字');
